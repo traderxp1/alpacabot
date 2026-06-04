@@ -1,6 +1,7 @@
 """
 Alpaca Stocks Bot - رنكو للأسهم الأمريكية
 نفس منطق بوت بايننس لكن على Alpaca Paper Trading
++ قاعدة بيانات PostgreSQL لحفظ الصفقات بشكل دائم
 """
 
 import os
@@ -12,14 +13,17 @@ from flask import Flask, request, jsonify
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ====================================================================
 # الإعدادات
 # ====================================================================
-ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "PKLWAHSB3YKRPVPIYTK2K3JU6E")
-ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", "3cNDSeDdiHCYuPYmbjGJvdG5NQmwsy1wrFWHFxsw5jnm")
+ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "renko2026")
+DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 
 # ====================================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -35,10 +39,107 @@ HEADERS = {
 }
 
 # ====================================================================
+# قاعدة البيانات
+# ====================================================================
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+def init_db():
+    """إنشاء الجداول عند أول تشغيل"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # جدول الصفقات المغلقة
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id SERIAL PRIMARY KEY,
+                        time TIMESTAMP DEFAULT NOW(),
+                        symbol VARCHAR(20),
+                        entry_price FLOAT,
+                        exit_price FLOAT,
+                        exit_reason VARCHAR(20),
+                        qty FLOAT,
+                        pnl FLOAT
+                    )
+                """)
+                # جدول الحالة النشطة
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS active_states (
+                        symbol VARCHAR(20) PRIMARY KEY,
+                        state_json TEXT,
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+            conn.commit()
+        log.info("✅ قاعدة البيانات جاهزة")
+    except Exception as e:
+        log.error(f"❌ فشل إنشاء الجداول: {e}")
+
+def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl):
+    """حفظ صفقة مغلقة"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO trades (symbol, entry_price, exit_price, exit_reason, qty, pnl)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (symbol, entry, exit_price, exit_reason, qty, pnl))
+            conn.commit()
+    except Exception as e:
+        log.error(f"فشل حفظ الصفقة: {e}")
+
+def load_trades(limit=50):
+    """تحميل آخر الصفقات"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM trades ORDER BY time DESC LIMIT %s", (limit,))
+                return cur.fetchall()
+    except Exception as e:
+        log.error(f"فشل تحميل الصفقات: {e}")
+        return []
+
+def save_state(symbol, state):
+    """حفظ حالة العملة"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO active_states (symbol, state_json, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (symbol) DO UPDATE
+                    SET state_json = EXCLUDED.state_json, updated_at = NOW()
+                """, (symbol, json.dumps(state)))
+            conn.commit()
+    except Exception as e:
+        log.error(f"فشل حفظ الحالة: {e}")
+
+def load_all_states():
+    """تحميل الحالات عند إعادة التشغيل"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT symbol, state_json FROM active_states")
+                rows = cur.fetchall()
+                return {r["symbol"]: json.loads(r["state_json"]) for r in rows}
+    except Exception as e:
+        log.error(f"فشل تحميل الحالات: {e}")
+        return {}
+
+def delete_state(symbol):
+    """حذف حالة عملة (بعد الريست)"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM active_states WHERE symbol = %s", (symbol,))
+            conn.commit()
+    except Exception as e:
+        log.error(f"فشل حذف الحالة: {e}")
+
+# ====================================================================
 # الحالة
 # ====================================================================
 states = {}
-trades_log = []
 processed_signals = []
 
 def fresh_state(symbol):
@@ -65,10 +166,12 @@ def get_state(symbol):
 def reset_symbol(symbol):
     with state_lock:
         states[symbol] = fresh_state(symbol)
+        delete_state(symbol)
 
 def log_action(symbol, action, details=""):
     s = get_state(symbol)
     s["last_action"] = action
+    save_state(symbol, s)
     log.info(f"[{symbol}] ACTION: {action} | {details}")
 
 def is_duplicate(data):
@@ -106,7 +209,7 @@ def get_current_price(symbol):
             headers=HEADERS, timeout=10
         )
         data = r.json()
-        return float(data["quote"]["ap"])  # ask price
+        return float(data["quote"]["ap"])
     except Exception:
         return None
 
@@ -140,27 +243,25 @@ def place_stop_loss(symbol, qty, sl_price):
         return None
 
 def market_buy(symbol, qty):
-    order = alpaca_post("orders", {
+    return alpaca_post("orders", {
         "symbol": symbol,
         "qty": str(round(qty, 6)),
         "side": "buy",
         "type": "market",
         "time_in_force": "day"
     })
-    return order
 
 def market_sell(symbol, qty):
-    order = alpaca_post("orders", {
+    return alpaca_post("orders", {
         "symbol": symbol,
         "qty": str(round(qty, 6)),
         "side": "sell",
         "type": "market",
         "time_in_force": "day"
     })
-    return order
 
 def stop_buy(symbol, qty, stop_price):
-    order = alpaca_post("orders", {
+    return alpaca_post("orders", {
         "symbol": symbol,
         "qty": str(round(qty, 6)),
         "side": "buy",
@@ -168,14 +269,13 @@ def stop_buy(symbol, qty, stop_price):
         "stop_price": str(round(stop_price, 4)),
         "time_in_force": "gtc"
     })
-    return order
 
 def is_market_open():
     try:
         clock = alpaca_get("clock")
         return clock.get("is_open", False)
     except Exception:
-        return True  # افترض مفتوح لو فشل الفحص
+        return True
 
 def get_position_qty(symbol):
     try:
@@ -205,7 +305,6 @@ def handle_pending_entry(data):
         current = get_current_price(symbol)
         log.info(f"[{symbol}] سعر حالي={current} إشارة={entry}")
 
-        # لو السعر تجاوز الإشارة بأكثر من 0.5% → شراء فوري
         if current and (current - entry) / entry * 100 > 0.5:
             log.info(f"[{symbol}] تجاوز الإشارة → شراء فوري")
             order = market_buy(symbol, qty)
@@ -216,10 +315,9 @@ def handle_pending_entry(data):
                     "entry_price": current, "backup_sl": sl, "tp_price": tp,
                     "qty": qty, "order_id": order["id"], "sl_order_id": sl_id
                 })
-            log_action(symbol, "ENTRY_MARKET", f"qty={qty}")
+            log_action(symbol, "ENTRY_MARKET_FALLBACK", f"qty={qty}")
             return {"status": "ok", "method": "market"}
 
-        # وضع أوردر بيستوب
         order = stop_buy(symbol, qty, entry)
         with state_lock:
             s.update({
@@ -237,10 +335,10 @@ def handle_pending_entry(data):
 
 
 def handle_exit(data):
-    symbol = data.get("symbol")
-    reason = data.get("exit_reason", "?")
-    exit_price = data.get("exit_price", 0)
-    pnl = data.get("pnl", 0)
+    symbol     = data.get("symbol")
+    reason     = data.get("exit_reason", "?")
+    exit_price = float(data.get("exit_price", 0))
+    pnl        = float(data.get("pnl", 0))
     s = get_state(symbol)
 
     if not s["in_trade"] and not s["pending"]:
@@ -249,8 +347,6 @@ def handle_exit(data):
     try:
         cancel_all_orders(symbol)
         qty = s["qty"]
-
-        # جرّب تجيب الكمية من Alpaca مباشرة
         actual_qty = get_position_qty(symbol)
         if actual_qty > 0:
             qty = actual_qty
@@ -262,14 +358,15 @@ def handle_exit(data):
         sell = market_sell(symbol, qty)
         log.info(f"[{symbol}] بيع: {sell['id']} السبب={reason}")
 
-        trades_log.append({
-            "time":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol":      symbol,
-            "entry":       s.get("entry_price"),
-            "exit":        exit_price,
-            "exit_reason": reason,
-            "pnl":         pnl,
-        })
+        # ✅ حفظ في قاعدة البيانات بشكل دائم
+        save_trade(
+            symbol=symbol,
+            entry=s.get("entry_price"),
+            exit_price=exit_price,
+            exit_reason=reason,
+            qty=qty,
+            pnl=pnl
+        )
 
         reset_symbol(symbol)
         log_action(symbol, "EXIT", f"reason={reason} sold={qty}")
@@ -291,7 +388,8 @@ def handle_update_backup_sl(data):
     if s["pending"]:
         with state_lock:
             s["backup_sl"] = new_sl
-        log_action(symbol, "UPDATE_SL_PENDING", f"SL={new_sl}")
+            save_state(symbol, s)
+        log_action(symbol, "UPDATE_BACKUP_SL_PENDING", f"SL={new_sl}")
         return {"status": "ok", "note": "محفوظ للتطبيق بعد التنفيذ"}
 
     try:
@@ -301,6 +399,7 @@ def handle_update_backup_sl(data):
             s["backup_sl"] = new_sl
             s["be_active"] = True
             s["sl_order_id"] = sl_id
+            save_state(symbol, s)
         log_action(symbol, "UPDATE_BACKUP_SL", f"SL={new_sl}")
         return {"status": "ok", "new_sl": new_sl}
     except Exception as e:
@@ -342,6 +441,7 @@ def monitor_orders():
                                 "in_trade": True, "pending": False,
                                 "qty": actual_qty, "sl_order_id": sl_id
                             })
+                            save_state(symbol, s)
                         log_action(symbol, "PENDING_FILLED", f"qty={actual_qty}")
                     elif status in ("canceled", "expired", "rejected"):
                         log.info(f"[{symbol}] أوردر {status}")
@@ -436,7 +536,7 @@ def dashboard():
             cards += f"""<div class="card"><h2>{sym}</h2>
 <div class="row"><span class="label">الوضع</span><span class="val {scls}">{status_txt}</span></div>
 <div class="row"><span class="label">سعر الدخول</span><span class="val">{st['entry_price'] or '—'}</span></div>
-<div class="row"><span class="label">🛡️ SL</span><span class="val red">{st['backup_sl'] or '—'}</span></div>
+<div class="row"><span class="label">🛡️ SL الاحتياطي</span><span class="val red">{st['backup_sl'] or '—'}</span></div>
 <div class="row"><span class="label">Take Profit</span><span class="val green">{st['tp_price'] or '—'}</span></div>
 <div class="row"><span class="label">الكمية</span><span class="val">{st['qty'] or '—'}</span></div>
 <div class="row"><span class="label">Breakeven</span><span class="val {'yellow' if st['be_active'] else 'label'}">{'✅ مفعّل' if st['be_active'] else 'غير مفعّل'}</span></div>
@@ -444,13 +544,16 @@ def dashboard():
 <div class="row"><span class="label">آخر خطأ</span><span class="val red">{st['last_error'] or '—'}</span></div>
 </div>"""
 
+    # ✅ تحميل الصفقات من قاعدة البيانات
+    trades = load_trades(50)
+
     summary = ""
     rows = '<p style="color:#555;font-size:12px;padding:8px">لا توجد صفقات بعد</p>'
-    if trades_log:
-        total_pnl = sum(float(t["pnl"]) for t in trades_log)
-        tp_count  = sum(1 for t in trades_log if t["exit_reason"] == "TP")
-        be_count  = sum(1 for t in trades_log if t["exit_reason"] in ("BE","SL_MARKET"))
-        sl_count  = sum(1 for t in trades_log if t["exit_reason"] == "SL")
+    if trades:
+        total_pnl = sum(float(t["pnl"] or 0) for t in trades)
+        tp_count  = sum(1 for t in trades if t["exit_reason"] == "TP")
+        be_count  = sum(1 for t in trades if t["exit_reason"] in ("BE", "SL_MARKET"))
+        sl_count  = sum(1 for t in trades if t["exit_reason"] == "SL")
         clr = "green" if total_pnl >= 0 else "red"
         summary = f'''<div class="card">
 <div class="row"><span class="label">الاجمالي</span><span class="val {clr}">{total_pnl:+.2f} USD</span></div>
@@ -458,8 +561,13 @@ def dashboard():
 <div class="row"><span class="label">➡️ بريك ايفن</span><span class="val yellow">{be_count}</span></div>
 <div class="row"><span class="label">❌ ستوب لوز</span><span class="val red">{sl_count}</span></div>
 </div>'''
-        body = "".join(f'<tr><td>{t["time"]}</td><td>{t["symbol"]}</td><td>{reason_ar(t["exit_reason"])}</td><td class="{"green" if float(t["pnl"])>=0 else "red"}">{float(t["pnl"]):+.2f}</td></tr>' for t in reversed(trades_log[-30:]))
-        rows = f'<table><tr><th>الوقت</th><th>رمز</th><th>النتيجة</th><th>P&L</th></tr>{body}</table>'
+        body = ""
+        for t in trades:
+            pnl_val = float(t["pnl"] or 0)
+            clr2 = "green" if pnl_val >= 0 else "red"
+            t_time = t["time"].strftime("%Y-%m-%d %H:%M") if hasattr(t["time"], "strftime") else str(t["time"])[:16]
+            body += f'<tr><td>{t_time}</td><td>{t["symbol"]}</td><td>{reason_ar(t["exit_reason"])}</td><td class="{clr2}">{pnl_val:+.2f}</td></tr>'
+        rows = f'<table><tr><th>الوقت (دبي)</th><th>رمز</th><th>النتيجة</th><th>P&L</th></tr>{body}</table>'
 
     html = f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
 <meta http-equiv="refresh" content="10"><title>Alpaca Bot</title><style>
@@ -479,11 +587,11 @@ td{{padding:7px 8px;border-bottom:1px solid #1a1a2a}}
 .footer{{color:#333;font-size:11px;margin-top:16px;text-align:center}}
 </style></head><body>
 <h1>⚡ ALPACA BOT · أسهم أمريكية</h1>
-<div class="sub">🧪 Paper Trading · فلوس وهمية</div>
+<div class="sub">🧪 Paper Trading · فلوس وهمية · 💾 قاعدة بيانات دائمة</div>
 {summary}
 <h2 style="color:#7878ff;font-size:13px;margin-bottom:12px">العملات النشطة</h2>
 {cards}
-<div class="card"><h2>سجل الصفقات ({len(trades_log)})</h2>{rows}</div>
+<div class="card"><h2>سجل الصفقات ({len(trades)})</h2>{rows}</div>
 <p class="footer">يتحدث كل 10 ثواني</p>
 </body></html>"""
     return html
@@ -492,11 +600,15 @@ td{{padding:7px 8px;border-bottom:1px solid #1a1a2a}}
 # ====================================================================
 # التشغيل
 # ====================================================================
-@app.before_request
-def startup():
-    pass
-
 if __name__ == "__main__":
+    # تهيئة قاعدة البيانات
+    init_db()
+    # استعادة الحالات من قاعدة البيانات عند إعادة التشغيل
+    recovered = load_all_states()
+    if recovered:
+        states.update(recovered)
+        log.info(f"✅ استعادة {len(recovered)} حالة من قاعدة البيانات")
+
     monitor_thread = threading.Thread(target=monitor_orders, daemon=True)
     monitor_thread.start()
     log.info("🚀 Alpaca Bot يبدأ")
