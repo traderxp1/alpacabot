@@ -12,8 +12,8 @@ import json
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from html import escape
 
 # ====================================================================
@@ -44,7 +44,7 @@ HEADERS = {
 # قاعدة البيانات
 # ====================================================================
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 def init_db():
     try:
