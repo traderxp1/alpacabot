@@ -101,6 +101,44 @@ def init_db():
                         details TEXT
                     )
                 """)
+
+                # --- V6 FIX: migrate old PostgreSQL tables instead of only CREATE IF NOT EXISTS ---
+                # Some old Railway databases already have a trades table without close_time.
+                # CREATE TABLE IF NOT EXISTS does not add missing columns, so we add them safely here.
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS open_time TIMESTAMP")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_time TIMESTAMP DEFAULT NOW()")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_price FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sl_price FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_price FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(20)")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS qty FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl_pct FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS duration_min INT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS rr_actual FLOAT")
+
+                cur.execute("ALTER TABLE active_states ADD COLUMN IF NOT EXISTS state_json TEXT")
+                cur.execute("ALTER TABLE active_states ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()")
+
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS action VARCHAR(40)")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS status VARCHAR(40)")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS reason TEXT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS entry_price FLOAT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS sl_price FLOAT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS tp_price FLOAT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS qty FLOAT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS exit_price FLOAT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS pnl FLOAT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS raw_json TEXT")
+
+                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
+                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS action VARCHAR(60)")
+                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS details TEXT")
             conn.commit()
         log.info("✅ قاعدة البيانات جاهزة")
     except Exception as e:
