@@ -1,7 +1,7 @@
 """
 Alpaca Stocks Bot - رنكو للأسهم الأمريكية
-نفس منطق بوت بايننس لكن على Alpaca Paper Trading
-+ قاعدة بيانات PostgreSQL لحفظ الصفقات بشكل دائم
++ قاعدة بيانات PostgreSQL
++ دعم ENTRY_FILLED مع ستوب لوز البوكس السابق
 """
 
 import os
@@ -28,7 +28,6 @@ DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 # ====================================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
 app = Flask(__name__)
 state_lock = threading.Lock()
 
@@ -45,11 +44,9 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    """إنشاء الجداول عند أول تشغيل"""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # جدول الصفقات المغلقة
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS trades (
                         id SERIAL PRIMARY KEY,
@@ -62,7 +59,6 @@ def init_db():
                         pnl FLOAT
                     )
                 """)
-                # جدول الحالة النشطة
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS active_states (
                         symbol VARCHAR(20) PRIMARY KEY,
@@ -76,7 +72,6 @@ def init_db():
         log.error(f"❌ فشل إنشاء الجداول: {e}")
 
 def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl):
-    """حفظ صفقة مغلقة"""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -89,7 +84,6 @@ def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl):
         log.error(f"فشل حفظ الصفقة: {e}")
 
 def load_trades(limit=50):
-    """تحميل آخر الصفقات"""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -100,7 +94,6 @@ def load_trades(limit=50):
         return []
 
 def save_state(symbol, state):
-    """حفظ حالة العملة"""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -115,7 +108,6 @@ def save_state(symbol, state):
         log.error(f"فشل حفظ الحالة: {e}")
 
 def load_all_states():
-    """تحميل الحالات عند إعادة التشغيل"""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -127,7 +119,6 @@ def load_all_states():
         return {}
 
 def delete_state(symbol):
-    """حذف حالة عملة (بعد الريست)"""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -184,7 +175,7 @@ def is_duplicate(data):
     return False
 
 # ====================================================================
-# دوال Alpaca API
+# دوال Alpaca
 # ====================================================================
 def alpaca_get(endpoint):
     r = requests.get(f"{ALPACA_BASE_URL}/{endpoint}", headers=HEADERS, timeout=10)
@@ -235,10 +226,10 @@ def place_stop_loss(symbol, qty, sl_price):
             "stop_price": str(round(sl_price, 4)),
             "time_in_force": "gtc"
         })
-        log.info(f"[{symbol}] SL احتياطي @ {sl_price} qty={qty}")
+        log.info(f"[{symbol}] ستوب لوز @ {sl_price} qty={qty}")
         return order["id"]
     except Exception as e:
-        log.error(f"[{symbol}] فشل SL: {e}")
+        log.error(f"[{symbol}] فشل ستوب لوز: {e}")
         get_state(symbol)["last_error"] = str(e)
         return None
 
@@ -334,6 +325,44 @@ def handle_pending_entry(data):
         return {"status": "error", "message": str(e)}
 
 
+def handle_entry_filled(data):
+    """
+    الأوردر المعلق اشتغل وتجاوز السعر —
+    Pine Script يرسل ستوب لوز البوكس السابق
+    """
+    symbol = data["symbol"]
+    entry  = float(data["entry"])
+    sl     = float(data["backup_sl"])  # ستوب لوز البوكس السابق
+    tp     = float(data["tp"])
+    qty    = float(data["qty"])
+    s = get_state(symbol)
+
+    try:
+        # ألغي أي أوردر قديم
+        cancel_all_orders(symbol)
+
+        # شراء فوري بنفس الكمية
+        order = market_buy(symbol, qty)
+        log.info(f"[{symbol}] ENTRY_FILLED شراء qty={qty}")
+
+        # ستوب لوز البوكس السابق
+        sl_id = place_stop_loss(symbol, qty, sl)
+
+        with state_lock:
+            s.update({
+                "in_trade": True, "pending": False,
+                "entry_price": entry, "backup_sl": sl, "tp_price": tp,
+                "qty": qty, "order_id": order["id"], "sl_order_id": sl_id
+            })
+        log_action(symbol, "ENTRY_FILLED", f"entry={entry} sl_prev={sl} qty={qty}")
+        return {"status": "ok", "method": "entry_filled"}
+
+    except Exception as e:
+        s["last_error"] = str(e)
+        log.error(f"[{symbol}] فشل ENTRY_FILLED: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 def handle_exit(data):
     symbol     = data.get("symbol")
     reason     = data.get("exit_reason", "?")
@@ -358,16 +387,7 @@ def handle_exit(data):
         sell = market_sell(symbol, qty)
         log.info(f"[{symbol}] بيع: {sell['id']} السبب={reason}")
 
-        # ✅ حفظ في قاعدة البيانات بشكل دائم
-        save_trade(
-            symbol=symbol,
-            entry=s.get("entry_price"),
-            exit_price=exit_price,
-            exit_reason=reason,
-            qty=qty,
-            pnl=pnl
-        )
-
+        save_trade(symbol, s.get("entry_price"), exit_price, reason, qty, pnl)
         reset_symbol(symbol)
         log_action(symbol, "EXIT", f"reason={reason} sold={qty}")
         return {"status": "ok", "sold": qty}
@@ -390,7 +410,7 @@ def handle_update_backup_sl(data):
             s["backup_sl"] = new_sl
             save_state(symbol, s)
         log_action(symbol, "UPDATE_BACKUP_SL_PENDING", f"SL={new_sl}")
-        return {"status": "ok", "note": "محفوظ للتطبيق بعد التنفيذ"}
+        return {"status": "ok", "note": "محفوظ"}
 
     try:
         cancel_all_orders(symbol)
@@ -485,6 +505,8 @@ def webhook():
 
         if action in ("PENDING_ENTRY", "ENTRY"):
             r = handle_pending_entry(data)
+        elif action == "ENTRY_FILLED":
+            r = handle_entry_filled(data)
         elif action == "EXIT":
             r = handle_exit(data)
         elif action == "UPDATE_BACKUP_SL":
@@ -544,9 +566,7 @@ def dashboard():
 <div class="row"><span class="label">آخر خطأ</span><span class="val red">{st['last_error'] or '—'}</span></div>
 </div>"""
 
-    # ✅ تحميل الصفقات من قاعدة البيانات
     trades = load_trades(50)
-
     summary = ""
     rows = '<p style="color:#555;font-size:12px;padding:8px">لا توجد صفقات بعد</p>'
     if trades:
@@ -587,7 +607,7 @@ td{{padding:7px 8px;border-bottom:1px solid #1a1a2a}}
 .footer{{color:#333;font-size:11px;margin-top:16px;text-align:center}}
 </style></head><body>
 <h1>⚡ ALPACA BOT · أسهم أمريكية</h1>
-<div class="sub">🧪 Paper Trading · فلوس وهمية · 💾 قاعدة بيانات دائمة</div>
+<div class="sub">🧪 Paper Trading · 💾 قاعدة بيانات دائمة</div>
 {summary}
 <h2 style="color:#7878ff;font-size:13px;margin-bottom:12px">العملات النشطة</h2>
 {cards}
@@ -601,14 +621,11 @@ td{{padding:7px 8px;border-bottom:1px solid #1a1a2a}}
 # التشغيل
 # ====================================================================
 if __name__ == "__main__":
-    # تهيئة قاعدة البيانات
     init_db()
-    # استعادة الحالات من قاعدة البيانات عند إعادة التشغيل
     recovered = load_all_states()
     if recovered:
         states.update(recovered)
-        log.info(f"✅ استعادة {len(recovered)} حالة من قاعدة البيانات")
-
+        log.info(f"✅ استعادة {len(recovered)} حالة")
     monitor_thread = threading.Thread(target=monitor_orders, daemon=True)
     monitor_thread.start()
     log.info("🚀 Alpaca Bot يبدأ")
