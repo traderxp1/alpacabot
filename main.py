@@ -1,5 +1,5 @@
 """
-Alpaca Stocks Bot v10 ULTRA FAST WEBHOOK ACK + SIMPLE DASHBOARD Railway/GitHub
+Alpaca Stocks Bot v12 NET FILTER + PROTECTION GUARD + SIMPLE DASHBOARD Railway/GitHub
 + قاعدة بيانات PostgreSQL كاملة
 + Fast Webhook ACK: يرد فوراً ثم ينفذ الإشارة في الخلفية
 """
@@ -24,6 +24,25 @@ ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "renko2026")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "")
+
+# ====================================================================
+# NET PROFIT / COST FILTER
+# ====================================================================
+# Blocks trades where the expected net TP is too weak compared to expected net SL.
+# Defaults are conservative for small stock/ETF Renko boxes.
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+NET_FILTER_ENABLED = os.environ.get("NET_FILTER_ENABLED", "true").lower() == "true"
+MIN_RISK_PCT       = env_float("MIN_RISK_PCT", 0.10)       # percent of entry price
+MIN_NET_RR         = env_float("MIN_NET_RR", 1.20)         # net profit / net loss minimum
+FEE_RATE_PER_SIDE  = env_float("FEE_RATE_PER_SIDE", 0.0)   # decimal, Alpaca stock commission often 0
+SLIPPAGE_PCT_RT    = env_float("SLIPPAGE_PCT_RT", 0.05)    # percent round trip, e.g. 0.05 = 0.05%
+FIXED_COST_RT      = env_float("FIXED_COST_RT", 0.0)       # fixed USD round trip
+
 
 # ====================================================================
 # TIMEZONE DISPLAY
@@ -462,6 +481,46 @@ def get_position_qty(symbol):
     except:
         return 0.0
 
+def net_profit_filter_check(entry, sl, tp, qty):
+    """Return (ok, reason). Buy-only quality filter before sending broker orders."""
+    if not NET_FILTER_ENABLED:
+        return True, ""
+    try:
+        entry = float(entry); sl = float(sl); tp = float(tp); qty = float(qty)
+        if entry <= 0 or qty <= 0:
+            return False, "net_filter: entry/qty invalid"
+        if sl >= entry:
+            return False, "net_filter: SL above/at entry"
+        if tp <= entry:
+            return False, "net_filter: TP below/at entry"
+        risk_pct = (entry - sl) / entry * 100.0
+        if risk_pct < MIN_RISK_PCT:
+            return False, f"net_filter: risk {risk_pct:.3f}% < min {MIN_RISK_PCT:.3f}%"
+
+        entry_value = entry * qty
+        tp_value = tp * qty
+        sl_value = sl * qty
+        fee_tp = (abs(entry_value) + abs(tp_value)) * FEE_RATE_PER_SIDE
+        fee_sl = (abs(entry_value) + abs(sl_value)) * FEE_RATE_PER_SIDE
+        slip_cost = abs(entry_value) * (SLIPPAGE_PCT_RT / 100.0)
+        fixed_half = FIXED_COST_RT / 2.0
+
+        gross_profit = (tp - entry) * qty
+        gross_loss = (entry - sl) * qty
+        expected_net_profit = gross_profit - fee_tp - slip_cost - fixed_half
+        expected_net_loss = gross_loss + fee_sl + slip_cost + fixed_half
+        if expected_net_profit <= 0:
+            return False, f"net_filter: expected net TP <= 0 ({expected_net_profit:.6f})"
+        if expected_net_loss <= 0:
+            return False, "net_filter: expected net loss invalid"
+        net_rr = expected_net_profit / expected_net_loss
+        if net_rr < MIN_NET_RR:
+            return False, f"net_filter: netRR {net_rr:.2f} < min {MIN_NET_RR:.2f}"
+        return True, f"net_filter ok risk={risk_pct:.3f}% netRR={net_rr:.2f}"
+    except Exception as e:
+        return False, f"net_filter error: {e}"
+
+
 # ====================================================================
 # معالجات الإشارات
 # ====================================================================
@@ -474,6 +533,9 @@ def handle_entry(data):
     s = get_state(symbol)
     if s["in_trade"] or s["pending"]:
         return {"status": "ignored"}
+    ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
+    if not ok_filter:
+        return {"status": "rejected", "reason": filter_reason}
     if not is_market_open():
         return {"status": "ignored", "reason": "السوق مغلق"}
     try:
@@ -504,6 +566,9 @@ def handle_pending_entry(data):
     s = get_state(symbol)
     if s["in_trade"] or s["pending"]:
         return {"status": "ignored"}
+    ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
+    if not ok_filter:
+        return {"status": "rejected", "reason": filter_reason}
     if not is_market_open():
         return {"status": "ignored", "reason": "السوق مغلق"}
     try:
@@ -542,6 +607,9 @@ def handle_entry_filled(data):
     tp     = float(data["tp"])
     qty    = float(data["qty"])
     s = get_state(symbol)
+    ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
+    if not ok_filter:
+        return {"status": "rejected", "reason": filter_reason}
     try:
         cancel_all_orders(symbol)
         order = market_buy(symbol, qty)
@@ -627,13 +695,70 @@ def handle_cancel_pending(data):
     log_action(symbol, "CANCEL_PENDING")
     return {"status": "ok"}
 
+
+def force_market_exit(symbol, reason, exit_price=None):
+    """Independent protection guard.
+    Closes an open long position at market if price crosses Current SL or TP,
+    even if TradingView did not send EXIT or broker-side stop failed.
+    """
+    s = get_state(symbol)
+    if not s.get("in_trade"):
+        return {"status": "ignored"}
+    try:
+        current = exit_price if exit_price is not None else get_current_price(symbol)
+        if current is None:
+            return {"status": "ignored", "reason": "no_price"}
+        actual_qty = get_position_qty(symbol)
+        qty = actual_qty if actual_qty > 0 else float(s.get("qty") or 0)
+        if qty <= 0:
+            reset_symbol(symbol)
+            log_action(symbol, "BROKER_FLAT_RESET", "no position qty during guard")
+            return {"status": "warning", "reason": "no_qty"}
+        cancel_all_orders(symbol)
+        market_sell(symbol, qty)
+        entry = float(s.get("entry_price") or current)
+        pnl = (current - entry) * qty
+        save_trade(symbol, entry, current, reason, qty, pnl,
+                   sl=s.get("initial_sl") or s.get("backup_sl"),
+                   current_sl=s.get("current_sl") or s.get("backup_sl"),
+                   tp=s.get("tp_price"), open_time=s.get("open_time"),
+                   trade_quality="Guard")
+        reset_symbol(symbol)
+        log_action(symbol, "FORCE_EXIT_" + reason, f"price={current} qty={qty}")
+        return {"status": "ok", "reason": reason, "price": current}
+    except Exception as e:
+        s["last_error"] = str(e)
+        save_state(symbol, s)
+        log.error(f"[{symbol}] force exit failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+def protection_guard_once():
+    """Checks all active trades independently from TradingView alerts."""
+    for symbol, st in list(states.items()):
+        if not st.get("in_trade"):
+            continue
+        try:
+            current = get_current_price(symbol)
+            if current is None:
+                continue
+            sl = st.get("current_sl") or st.get("backup_sl")
+            tp = st.get("tp_price")
+            if sl is not None and current <= float(sl):
+                force_market_exit(symbol, "GUARD_SL", current)
+            elif tp is not None and current >= float(tp):
+                force_market_exit(symbol, "GUARD_TP", current)
+        except Exception as e:
+            log.error(f"[{symbol}] protection guard error: {e}")
+
 # ====================================================================
 # مراقب الأوردرات
 # ====================================================================
 def monitor_orders():
     while True:
         try:
-            time_module.sleep(15)
+            time_module.sleep(5)
+
+            # 1) Pending order monitor
             for symbol in [s for s, st in list(states.items()) if st.get("pending")]:
                 s = get_state(symbol)
                 if not s.get("pending") or not s.get("order_id"):
@@ -655,9 +780,13 @@ def monitor_orders():
                     elif status in ("canceled", "expired", "rejected"):
                         reset_symbol(symbol)
                 except Exception as e:
-                    log.error(f"[{symbol}] مراقب: {e}")
+                    log.error(f"[{symbol}] pending monitor: {e}")
+
+            # 2) Independent broker protection guard for active trades
+            protection_guard_once()
+
         except Exception as e:
-            log.error(f"مراقب: {e}")
+            log.error(f"monitor_orders: {e}")
 
 # ====================================================================
 # ULTRA FAST WEBHOOK QUEUE
