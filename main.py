@@ -1,5 +1,5 @@
 """
-Alpaca Stocks Bot v12 NET FILTER + PROTECTION GUARD + SIMPLE DASHBOARD Railway/GitHub
+Alpaca Stocks Bot v13 FULL PROTECTION + SIMPLE DASHBOARD Railway/GitHub
 + قاعدة بيانات PostgreSQL كاملة
 + Fast Webhook ACK: يرد فوراً ثم ينفذ الإشارة في الخلفية
 """
@@ -42,6 +42,15 @@ MIN_NET_RR         = env_float("MIN_NET_RR", 1.20)         # net profit / net lo
 FEE_RATE_PER_SIDE  = env_float("FEE_RATE_PER_SIDE", 0.0)   # decimal, Alpaca stock commission often 0
 SLIPPAGE_PCT_RT    = env_float("SLIPPAGE_PCT_RT", 0.05)    # percent round trip, e.g. 0.05 = 0.05%
 FIXED_COST_RT      = env_float("FIXED_COST_RT", 0.0)       # fixed USD round trip
+
+# ====================================================================
+# BROKER-SIDE PROTECTION
+# ====================================================================
+# BRACKET means: entry + TP + SL are submitted to Alpaca together.
+# If bracket/OCO cannot be created, the bot refuses the entry or closes immediately.
+BROKER_PROTECTION_MODE = os.environ.get("BROKER_PROTECTION_MODE", "BRACKET").upper()
+REQUIRE_BROKER_PROTECTION = os.environ.get("REQUIRE_BROKER_PROTECTION", "true").lower() == "true"
+
 
 
 # ====================================================================
@@ -460,6 +469,94 @@ def place_stop_loss(symbol, qty, sl_price):
         get_state(symbol)["last_error"] = str(e)
         return None
 
+def round_price_4(price):
+    return str(round(float(price), 4))
+
+def place_bracket_market_buy(symbol, qty, sl_price, tp_price):
+    """Alpaca broker-side bracket: market buy with attached TP and SL.
+    If this fails, no entry is opened, which prevents naked/unprotected positions.
+    """
+    payload = {
+        "symbol": symbol,
+        "qty": str(round(float(qty), 6)),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "day",
+        "order_class": "bracket",
+        "take_profit": {"limit_price": round_price_4(tp_price)},
+        "stop_loss": {"stop_price": round_price_4(sl_price)},
+    }
+    return alpaca_post("orders", payload)
+
+def place_bracket_stop_buy(symbol, qty, entry_price, sl_price, tp_price):
+    """Alpaca broker-side bracket for a buy-stop entry.
+    Used for pending entries where Alpaca supports bracket stop orders.
+    """
+    payload = {
+        "symbol": symbol,
+        "qty": str(round(float(qty), 6)),
+        "side": "buy",
+        "type": "stop",
+        "stop_price": round_price_4(entry_price),
+        "time_in_force": "day",
+        "order_class": "bracket",
+        "take_profit": {"limit_price": round_price_4(tp_price)},
+        "stop_loss": {"stop_price": round_price_4(sl_price)},
+    }
+    return alpaca_post("orders", payload)
+
+def place_oco_exit(symbol, qty, sl_price, tp_price):
+    """Alpaca broker-side OCO for an already-open long position."""
+    payload = {
+        "symbol": symbol,
+        "qty": str(round(float(qty), 6)),
+        "side": "sell",
+        "type": "limit",
+        "time_in_force": "gtc",
+        "order_class": "oco",
+        "take_profit": {"limit_price": round_price_4(tp_price)},
+        "stop_loss": {"stop_price": round_price_4(sl_price)},
+    }
+    return alpaca_post("orders", payload)
+
+def place_broker_exit_protection(symbol, qty, sl_price, tp_price):
+    try:
+        if BROKER_PROTECTION_MODE in ("BRACKET", "OCO", "BROKER", "FULL"):
+            order = place_oco_exit(symbol, qty, sl_price, tp_price)
+            return order.get("id") or "OCO"
+    except Exception as e:
+        log.error(f"[{symbol}] فشل OCO: {e}")
+        get_state(symbol)["last_error"] = str(e)
+        if REQUIRE_BROKER_PROTECTION:
+            return None
+    return place_stop_loss(symbol, qty, sl_price)
+
+def emergency_close_unprotected(symbol, qty, reason="NO_BROKER_PROTECTION"):
+    try:
+        actual_qty = get_position_qty(symbol)
+        sell_qty = actual_qty if actual_qty > 0 else float(qty or 0)
+        if sell_qty <= 0:
+            reset_symbol(symbol)
+            return False
+        current = get_current_price(symbol) or 0.0
+        market_sell(symbol, sell_qty)
+        st = get_state(symbol)
+        entry = float(st.get("entry_price") or current or 0)
+        pnl = (current - entry) * sell_qty if current and entry else 0.0
+        save_trade(symbol, entry, current, reason, sell_qty, pnl,
+                   sl=st.get("initial_sl") or st.get("backup_sl"),
+                   current_sl=st.get("current_sl") or st.get("backup_sl"),
+                   tp=st.get("tp_price"), open_time=st.get("open_time"),
+                   trade_quality="ProtectionFail")
+        reset_symbol(symbol)
+        log_action(symbol, reason, f"closed unprotected qty={sell_qty}")
+        return True
+    except Exception as e:
+        log.error(f"[{symbol}] emergency close failed: {e}")
+        get_state(symbol)["last_error"] = str(e)
+        save_state(symbol, get_state(symbol))
+        return False
+
 def market_buy(symbol, qty):
     return alpaca_post("orders", {"symbol": symbol, "qty": str(round(qty, 6)), "side": "buy", "type": "market", "time_in_force": "day"})
 
@@ -540,8 +637,8 @@ def handle_entry(data):
         return {"status": "ignored", "reason": "السوق مغلق"}
     try:
         cancel_all_orders(symbol)
-        order = market_buy(symbol, qty)
-        sl_id = place_stop_loss(symbol, qty, sl)
+        order = place_bracket_market_buy(symbol, qty, sl, tp)
+        sl_id = order.get("id") or "BRACKET"
         with state_lock:
             s.update({
                 "in_trade": True, "pending": False,
@@ -574,8 +671,8 @@ def handle_pending_entry(data):
     try:
         current = get_current_price(symbol)
         if current and (current - entry) / entry * 100 > 0.5:
-            order = market_buy(symbol, qty)
-            sl_id = place_stop_loss(symbol, qty, sl)
+            order = place_bracket_market_buy(symbol, qty, sl, tp)
+            sl_id = order.get("id") or "BRACKET"
             with state_lock:
                 s.update({
                     "in_trade": True, "pending": False,
@@ -585,7 +682,7 @@ def handle_pending_entry(data):
                 })
             log_action(symbol, "ENTRY_MARKET_FALLBACK", f"qty={qty}")
             return {"status": "ok", "method": "market"}
-        order = stop_buy(symbol, qty, entry)
+        order = place_bracket_stop_buy(symbol, qty, entry, sl, tp)
         with state_lock:
             s.update({
                 "pending": True,
@@ -612,8 +709,8 @@ def handle_entry_filled(data):
         return {"status": "rejected", "reason": filter_reason}
     try:
         cancel_all_orders(symbol)
-        order = market_buy(symbol, qty)
-        sl_id = place_stop_loss(symbol, qty, sl)
+        order = place_bracket_market_buy(symbol, qty, sl, tp)
+        sl_id = order.get("id") or "BRACKET"
         with state_lock:
             s.update({
                 "in_trade": True, "pending": False,
@@ -673,7 +770,10 @@ def handle_update_backup_sl(data):
         return {"status": "ok"}
     try:
         cancel_all_orders(symbol)
-        sl_id = place_stop_loss(symbol, s["qty"], new_sl)
+        sl_id = place_broker_exit_protection(symbol, s["qty"], new_sl, s.get("tp_price"))
+        if not sl_id:
+            emergency_close_unprotected(symbol, s["qty"], "NO_BROKER_PROTECTION_AFTER_SL_UPDATE")
+            return {"status": "error", "reason": "broker protection failed after SL update - closed"}
         with state_lock:
             s["backup_sl"] = new_sl
             s["current_sl"] = new_sl
@@ -768,7 +868,7 @@ def monitor_orders():
                     status = order.get("status", "")
                     if status == "filled":
                         actual_qty = float(order.get("filled_qty", s["qty"]))
-                        sl_id = place_stop_loss(symbol, actual_qty, s["backup_sl"])
+                        sl_id = s.get("sl_order_id") or s.get("order_id")
                         with state_lock:
                             s.update({
                                 "in_trade": True, "pending": False,
