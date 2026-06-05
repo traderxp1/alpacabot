@@ -12,6 +12,7 @@ import time as time_module
 import json
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import requests
 import psycopg
 from psycopg.rows import dict_row
@@ -23,6 +24,30 @@ ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "renko2026")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "")
+
+# ====================================================================
+# TIMEZONE DISPLAY
+# ====================================================================
+APP_TZ_NAME = os.environ.get("TZ", "Asia/Dubai")
+try:
+    APP_TZ = ZoneInfo(APP_TZ_NAME)
+except Exception:
+    APP_TZ_NAME = "Asia/Dubai"
+    APP_TZ = ZoneInfo("Asia/Dubai")
+UTC_TZ = ZoneInfo("UTC")
+
+def app_now():
+    return datetime.now(APP_TZ)
+
+def to_app_time(dt):
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC_TZ)
+        return dt.astimezone(APP_TZ)
+    except Exception:
+        return dt
 
 # V6 Dashboard: Active positions + performance analytics + signal/action logs.
 # Compatible with latest TradingView Renko strategy alerts:
@@ -783,11 +808,11 @@ def metric_row(label, value, cls=""):
 @app.route("/", methods=["GET"])
 def dashboard():
     mode_txt = '🧪 PAPER' if 'paper-api' in ALPACA_BASE_URL else '🔴 LIVE'
-    now = datetime.utcnow()
+    now = app_now()
     trades = load_trades(300)
     signals = load_signal_events(20)
 
-    today = [t for t in trades if trade_dt(t, "close_time") and trade_dt(t, "close_time").date() == now.date()]
+    today = [t for t in trades if trade_dt(t, "close_time") and to_app_time(trade_dt(t, "close_time")) and to_app_time(trade_dt(t, "close_time")).date() == now.date()]
     m_all = calc_trade_metrics(trades)
     m_today = calc_trade_metrics(today)
 
@@ -832,7 +857,7 @@ def dashboard():
 
     trade_rows = ""
     for t in trades[:25]:
-        pnl_val = safe_float(t.get("pnl"), 0.0); cls = "green" if pnl_val >= 0 else "red"; ct = trade_dt(t, "close_time"); ct_str = ct.strftime("%m-%d %H:%M") if ct else "—"
+        pnl_val = safe_float(t.get("pnl"), 0.0); cls = "green" if pnl_val >= 0 else "red"; ct = to_app_time(trade_dt(t, "close_time")); ct_str = ct.strftime("%m-%d %H:%M") if ct else "—"
         init_sl = t.get('initial_sl_price') if t.get('initial_sl_price') is not None else t.get('sl_price')
         cur_sl = t.get('current_sl_price') if t.get('current_sl_price') is not None else t.get('sl_price')
         trade_rows += f'''<tr><td>{ct_str}</td><td><b>{escape(str(t.get('symbol') or '—'))}</b></td><td>{reason_ar(t.get('exit_reason'))}</td><td>{fmt_num(t.get('entry_price'),8)}</td><td>{fmt_num(t.get('exit_price'),8)}</td><td class="red">{fmt_num(init_sl,8)}</td><td class="yellow">{fmt_num(cur_sl,8)}</td><td class="green">{fmt_num(t.get('tp_price'),8)}</td><td class="{cls}">{fmt_money(pnl_val)}</td><td>{fmt_num(t.get('rr_actual'),2)}R</td><td>{t.get('duration_min') or '—'}د</td></tr>'''
@@ -841,7 +866,7 @@ def dashboard():
 
     signal_rows = ""
     for s in signals[:12]:
-        status = str(s.get("status") or ""); cls = "green" if status in ("ok","success") else "yellow" if status in ("ignored","مكرر","duplicate") else "red" if status == "error" else ""; rt = safe_dt(s.get("received_at")); rt_str = rt.strftime("%H:%M:%S") if rt else "—"
+        status = str(s.get("status") or ""); cls = "green" if status in ("ok","success") else "yellow" if status in ("ignored","مكرر","duplicate") else "red" if status == "error" else ""; rt = to_app_time(safe_dt(s.get("received_at"))); rt_str = rt.strftime("%H:%M:%S") if rt else "—"
         signal_rows += f'''<tr><td>{rt_str}</td><td><b>{escape(str(s.get('symbol') or '—'))}</b></td><td>{escape(str(s.get('action') or '—'))}</td><td class="{cls}">{escape(status or '—')}</td><td>{fmt_num(s.get('entry_price'),8)}</td><td>{fmt_num(s.get('qty'),8)}</td><td>{escape(str(s.get('reason') or '—'))}</td></tr>'''
     if not signal_rows:
         signal_rows = '<tr><td colspan="7" class="empty">لا توجد إشارات بعد</td></tr>'
@@ -851,12 +876,12 @@ def dashboard():
 <title>Renko Bot V10 Fast</title><style>
 *{{box-sizing:border-box;margin:0;padding:0}}body{{background:#080910;color:#e6e6ee;font-family:Arial,Tahoma,sans-serif;padding:14px;font-size:12px}}h1{{color:#00ff88;font-size:18px;margin-bottom:4px}}h2{{color:#9ea0ff;font-size:13px;margin:6px 0 10px}}.sub{{color:#888;font-size:11px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}}.stat{{background:#0d0e17;border:1px solid #24263a;border-radius:8px;padding:9px;text-align:center;min-height:62px}}.stat-val{{font-size:15px;font-weight:800;color:#fff}}.stat-lbl{{font-size:10px;color:#aaa;margin-top:3px}}.stat-sub{{font-size:9px;color:#666;margin-top:3px}}.card{{background:#12131d;border:1px solid #24263a;border-radius:9px;padding:10px;margin-bottom:10px}}.table-wrap{{overflow-x:auto;border-radius:7px;border:1px solid #24263a}}table{{width:100%;border-collapse:collapse;font-size:11px;min-width:760px}}th{{background:#1a1c2b;color:#9ea0ff;padding:7px;text-align:right;white-space:nowrap}}td{{padding:6px 7px;border-bottom:1px solid #202235;white-space:nowrap}}.green{{color:#00ff88!important}}.red{{color:#ff4d6d!important}}.yellow{{color:#ffd166!important}}.empty{{color:#777;text-align:center;padding:14px}}.footer{{color:#555;text-align:center;font-size:10px;margin-top:10px}}
 </style></head><body>
-<h1>⚡ ALPACA BOT · Simple Dashboard</h1><div class="sub">{mode_txt} · Alpaca Stocks · تحديث كل 10 ثواني · مختصر للتحليل السريع</div><div class="grid">{top_stats}</div>
+<h1>⚡ ALPACA BOT · Simple Dashboard</h1><div class="sub">{mode_txt} · Alpaca Stocks · تحديث كل 10 ثواني · توقيت الإمارات · مختصر للتحليل السريع</div><div class="grid">{top_stats}</div>
 <div class="card"><h2>الصفقات النشطة</h2><div class="table-wrap"><table><tr><th>سهم</th><th>حالة</th><th>السعر</th><th>دخول</th><th>Initial SL</th><th>Current SL</th><th>TP</th><th>Qty</th><th>Live P&L</th><th>Live R</th><th>آخر إجراء</th></tr>{active_rows}</table></div></div>
 <div class="card"><h2>الأداء حسب السهم</h2><div class="table-wrap"><table><tr><th>سهم</th><th>Trades</th><th>Net</th><th>Win%</th><th>PF</th><th>TP/BE/SL</th><th>Avg R</th></tr>{symbol_rows}</table></div></div>
 <div class="card"><h2>آخر الصفقات</h2><div class="table-wrap"><table><tr><th>وقت</th><th>سهم</th><th>نتيجة</th><th>دخول</th><th>خروج</th><th>Initial SL</th><th>Current SL</th><th>TP</th><th>P&L</th><th>R</th><th>مدة</th></tr>{trade_rows}</table></div></div>
 <div class="card"><h2>آخر إشارات Webhook</h2><div class="table-wrap"><table><tr><th>وقت</th><th>سهم</th><th>Action</th><th>Status</th><th>Entry</th><th>Qty</th><th>Reason</th></tr>{signal_rows}</table></div></div>
-<p class="footer">V10 Fast ACK · R محسوب من Initial SL للصفقات الجديدة فقط</p></body></html>'''
+<p class="footer">V10 Fast ACK · UAE Time · R محسوب من Initial SL للصفقات الجديدة فقط</p></body></html>'''
     return html_page
 
 # ====================================================================
