@@ -1,5 +1,5 @@
 """
-Alpaca Stocks Bot v9 FAST WEBHOOK ACK + SIMPLE DASHBOARD Railway/GitHub
+Alpaca Stocks Bot v10 ULTRA FAST WEBHOOK ACK + SIMPLE DASHBOARD Railway/GitHub
 + قاعدة بيانات PostgreSQL كاملة
 + Fast Webhook ACK: يرد فوراً ثم ينفذ الإشارة في الخلفية
 """
@@ -635,7 +635,7 @@ def monitor_orders():
             log.error(f"مراقب: {e}")
 
 # ====================================================================
-# FAST WEBHOOK QUEUE
+# ULTRA FAST WEBHOOK QUEUE
 # ====================================================================
 def process_signal_task(data, action):
     try:
@@ -654,7 +654,12 @@ def process_signal_task(data, action):
             r = handle_cancel_pending(data)
         else:
             r = {"status": "غير معروف", "action": action}
-        log_signal_event(data.get("symbol"), action, str(r.get("status", "")), str(r.get("reason") or r.get("message") or r.get("action") or ""), data)
+        log_signal_event(
+            data.get("symbol"), action,
+            str(r.get("status", "")),
+            str(r.get("reason") or r.get("message") or r.get("action") or ""),
+            data
+        )
     except Exception as e:
         log.error(f"فشل معالجة إشارة الخلفية: {e}", exc_info=True)
         try:
@@ -662,27 +667,13 @@ def process_signal_task(data, action):
         except Exception:
             pass
 
-def signal_worker():
-    while True:
-        try:
-            data, action = signal_queue.get()
-            process_signal_task(data, action)
-            signal_queue.task_done()
-        except Exception as e:
-            log.error(f"Signal worker error: {e}", exc_info=True)
-            time_module.sleep(1)
-
-# ====================================================================
-# Webhook
-# ====================================================================
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    secret = request.headers.get("X-Webhook-Secret") or request.args.get("secret")
-    if secret != WEBHOOK_SECRET:
-        return jsonify({"error": "غير مصرح"}), 401
+def process_raw_signal(raw):
+    # Parse and process TradingView payload completely in the background.
+    # /webhook returns 200 OK before JSON parsing, DB writes, duplicate checks,
+    # or broker API calls. This is the fastest ACK path for TradingView.
+    data = None
     try:
-        raw = request.get_data(as_text=True).strip()
-        data = None
+        raw = (raw or "").strip()
         for line in reversed(raw.splitlines()):
             line = line.strip()
             if line.startswith("{"):
@@ -692,23 +683,53 @@ def webhook():
                 except Exception:
                     continue
         if not data:
-            return jsonify({"error": "JSON خاطئ"}), 400
+            log_signal_event("", "BAD_JSON", "bad_json", "JSON خاطئ", {"raw": raw[:2000]})
+            return
         if not data.get("symbol"):
-            return jsonify({"error": "لا يوجد رمز"}), 400
+            log_signal_event("", str(data.get("action", "")).upper(), "bad_symbol", "لا يوجد رمز", data)
+            return
         data["symbol"] = clean_symbol(data["symbol"])
-        action = data.get("action", "").upper()
+        action = str(data.get("action", "")).upper()
         if is_duplicate(data):
             log_signal_event(data.get("symbol"), action, "duplicate", "duplicate ignored", data)
-            return jsonify({"status": "duplicate", "symbol": data.get("symbol"), "action": action}), 200
-
-        # مهم: نرد على TradingView فوراً، ثم ننفذ الطلب في الخلفية.
-        # هذا يمنع رسالة: Webhook delivery failed - request took too long and timed out.
-        signal_queue.put((data, action))
-        log.info(f"Queued signal: {action} {data.get('symbol')}")
-        return jsonify({"status": "queued", "symbol": data.get("symbol"), "action": action}), 200
+            return
+        process_signal_task(data, action)
     except Exception as e:
-        log.error(f"Webhook خطأ: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        log.error(f"Raw signal worker parse/process error: {e}", exc_info=True)
+        try:
+            log_signal_event((data or {}).get("symbol"), str((data or {}).get("action", "ERROR")).upper(), "error", str(e), data or {"raw": str(raw)[:2000]})
+        except Exception:
+            pass
+
+def signal_worker():
+    while True:
+        try:
+            raw = signal_queue.get()
+            process_raw_signal(raw)
+            signal_queue.task_done()
+        except Exception as e:
+            log.error(f"Signal worker error: {e}", exc_info=True)
+            time_module.sleep(1)
+
+# ====================================================================
+# Webhook - ULTRA FAST ACK
+# ====================================================================
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    secret = request.headers.get("X-Webhook-Secret") or request.args.get("secret")
+    if secret != WEBHOOK_SECRET:
+        return "unauthorized", 401
+
+    # أسرع مسار ممكن:
+    # نقرأ النص، نرميه في queue، ونرجع OK فوراً.
+    # لا JSON parsing، لا database، لا Binance/Alpaca، لا logging قبل الرد.
+    try:
+        raw = request.get_data(as_text=True, cache=False)
+        signal_queue.put_nowait(raw)
+        return "OK", 200, {"Content-Type": "text/plain"}
+    except Exception:
+        log.exception("Ultra-fast webhook enqueue failed")
+        return "OK", 200, {"Content-Type": "text/plain"}
 
 # ====================================================================
 # Reset
@@ -827,7 +848,7 @@ def dashboard():
 
     html_page = f'''<!DOCTYPE html><html dir="rtl" lang="ar"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="10">
-<title>Renko Bot V9 Fast</title><style>
+<title>Renko Bot V10 Fast</title><style>
 *{{box-sizing:border-box;margin:0;padding:0}}body{{background:#080910;color:#e6e6ee;font-family:Arial,Tahoma,sans-serif;padding:14px;font-size:12px}}h1{{color:#00ff88;font-size:18px;margin-bottom:4px}}h2{{color:#9ea0ff;font-size:13px;margin:6px 0 10px}}.sub{{color:#888;font-size:11px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}}.stat{{background:#0d0e17;border:1px solid #24263a;border-radius:8px;padding:9px;text-align:center;min-height:62px}}.stat-val{{font-size:15px;font-weight:800;color:#fff}}.stat-lbl{{font-size:10px;color:#aaa;margin-top:3px}}.stat-sub{{font-size:9px;color:#666;margin-top:3px}}.card{{background:#12131d;border:1px solid #24263a;border-radius:9px;padding:10px;margin-bottom:10px}}.table-wrap{{overflow-x:auto;border-radius:7px;border:1px solid #24263a}}table{{width:100%;border-collapse:collapse;font-size:11px;min-width:760px}}th{{background:#1a1c2b;color:#9ea0ff;padding:7px;text-align:right;white-space:nowrap}}td{{padding:6px 7px;border-bottom:1px solid #202235;white-space:nowrap}}.green{{color:#00ff88!important}}.red{{color:#ff4d6d!important}}.yellow{{color:#ffd166!important}}.empty{{color:#777;text-align:center;padding:14px}}.footer{{color:#555;text-align:center;font-size:10px;margin-top:10px}}
 </style></head><body>
 <h1>⚡ ALPACA BOT · Simple Dashboard</h1><div class="sub">{mode_txt} · Alpaca Stocks · تحديث كل 10 ثواني · مختصر للتحليل السريع</div><div class="grid">{top_stats}</div>
@@ -835,7 +856,7 @@ def dashboard():
 <div class="card"><h2>الأداء حسب السهم</h2><div class="table-wrap"><table><tr><th>سهم</th><th>Trades</th><th>Net</th><th>Win%</th><th>PF</th><th>TP/BE/SL</th><th>Avg R</th></tr>{symbol_rows}</table></div></div>
 <div class="card"><h2>آخر الصفقات</h2><div class="table-wrap"><table><tr><th>وقت</th><th>سهم</th><th>نتيجة</th><th>دخول</th><th>خروج</th><th>Initial SL</th><th>Current SL</th><th>TP</th><th>P&L</th><th>R</th><th>مدة</th></tr>{trade_rows}</table></div></div>
 <div class="card"><h2>آخر إشارات Webhook</h2><div class="table-wrap"><table><tr><th>وقت</th><th>سهم</th><th>Action</th><th>Status</th><th>Entry</th><th>Qty</th><th>Reason</th></tr>{signal_rows}</table></div></div>
-<p class="footer">V9 Fast ACK · R محسوب من Initial SL للصفقات الجديدة فقط</p></body></html>'''
+<p class="footer">V10 Fast ACK · R محسوب من Initial SL للصفقات الجديدة فقط</p></body></html>'''
     return html_page
 
 # ====================================================================
