@@ -790,13 +790,38 @@ def dashboard():
 # ====================================================================
 # التشغيل
 # ====================================================================
-if __name__ == "__main__":
+_initialized = False
+
+def startup():
+    global _initialized
+    if _initialized:
+        return
+    _initialized = True
+
+    # Important for Railway/Gunicorn:
+    # __main__ does not run when Railway starts the app with: gunicorn main:app
+    # So DB tables and the monitor thread must be initialized on import / first request.
     init_db()
     recovered = load_all_states()
     if recovered:
         states.update(recovered)
         log.info(f"✅ استعادة {len(recovered)} حالة")
+
     monitor_thread = threading.Thread(target=monitor_orders, daemon=True)
     monitor_thread.start()
+    log.info("✅ Alpaca bot startup complete")
+
+@app.before_request
+def before_request_startup():
+    startup()
+
+# Start once when imported by Gunicorn on Railway.
+try:
+    startup()
+except Exception as e:
+    # Keep the web process alive so the dashboard can still show errors/logs.
+    log.error(f"Startup error: {e}", exc_info=True)
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
