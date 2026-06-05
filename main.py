@@ -1,5 +1,5 @@
 """
-Alpaca Stocks Bot v6 ANALYTICS DASHBOARD Railway/GitHub
+Alpaca Stocks Bot v8 SIMPLE DASHBOARD + INITIAL SL FIX Railway/GitHub
 + قاعدة بيانات PostgreSQL كاملة
 + داشبورد تحليلي شامل V6: أداء، إشارات، أحداث، صفقات نشطة
 """
@@ -59,13 +59,16 @@ def init_db():
                         entry_price FLOAT,
                         exit_price FLOAT,
                         sl_price FLOAT,
+                        initial_sl_price FLOAT,
+                        current_sl_price FLOAT,
                         tp_price FLOAT,
                         exit_reason VARCHAR(20),
                         qty FLOAT,
                         pnl FLOAT,
                         pnl_pct FLOAT,
                         duration_min INT,
-                        rr_actual FLOAT
+                        rr_actual FLOAT,
+                        trade_quality VARCHAR(30) DEFAULT 'Clean'
                     )
                 """)
                 cur.execute("""
@@ -85,6 +88,8 @@ def init_db():
                         reason TEXT,
                         entry_price FLOAT,
                         sl_price FLOAT,
+                        initial_sl_price FLOAT,
+                        current_sl_price FLOAT,
                         tp_price FLOAT,
                         qty FLOAT,
                         exit_price FLOAT,
@@ -111,6 +116,8 @@ def init_db():
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sl_price FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS initial_sl_price FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS current_sl_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(20)")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS qty FLOAT")
@@ -118,6 +125,7 @@ def init_db():
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl_pct FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS duration_min INT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS rr_actual FLOAT")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_quality VARCHAR(30) DEFAULT 'Clean'")
 
                 cur.execute("ALTER TABLE active_states ADD COLUMN IF NOT EXISTS state_json TEXT")
                 cur.execute("ALTER TABLE active_states ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()")
@@ -144,10 +152,13 @@ def init_db():
     except Exception as e:
         log.error(f"❌ فشل: {e}")
 
-def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl, sl=None, tp=None, open_time=None):
+def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl, sl=None, tp=None, open_time=None, current_sl=None, trade_quality="Clean"):
+    """Save closed trade. sl = initial SL; current_sl = latest backup SL after BE updates."""
     try:
         pnl_pct = round((pnl / (entry * qty)) * 100, 4) if entry and qty and entry * qty > 0 else None
-        risk = entry - sl if sl and entry else None
+        initial_sl = sl
+        current_sl = current_sl if current_sl is not None else sl
+        risk = entry - initial_sl if initial_sl and entry else None
         reward = exit_price - entry if exit_price and entry else None
         rr_actual = round(reward / risk, 3) if risk and risk > 0 and reward is not None else None
         duration_min = None
@@ -156,18 +167,18 @@ def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl, sl=None, tp=Non
                 if isinstance(open_time, str):
                     open_time = datetime.fromisoformat(open_time)
                 delta = datetime.utcnow() - open_time
-                duration_min = int(delta.total_seconds() / 60)
+                duration_min = max(0, int(delta.total_seconds() / 60))
             except:
                 pass
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO trades
-                    (open_time, symbol, entry_price, exit_price, sl_price, tp_price,
-                     exit_reason, qty, pnl, pnl_pct, duration_min, rr_actual)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (open_time, symbol, entry, exit_price, sl, tp,
-                      exit_reason, qty, pnl, pnl_pct, duration_min, rr_actual))
+                    (open_time, symbol, entry_price, exit_price, sl_price, initial_sl_price, current_sl_price, tp_price,
+                     exit_reason, qty, pnl, pnl_pct, duration_min, rr_actual, trade_quality)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (open_time, symbol, entry, exit_price, initial_sl, initial_sl, current_sl, tp,
+                      exit_reason, qty, pnl, pnl_pct, duration_min, rr_actual, trade_quality))
             conn.commit()
     except Exception as e:
         log.error(f"فشل حفظ الصفقة: {e}")
@@ -313,7 +324,7 @@ processed_signals = []
 def fresh_state(symbol):
     return {
         "in_trade": False, "pending": False, "symbol": symbol,
-        "entry_price": None, "backup_sl": None, "tp_price": None,
+        "entry_price": None, "backup_sl": None, "initial_sl": None, "current_sl": None, "tp_price": None,
         "qty": 0.0, "order_id": None, "sl_order_id": None,
         "be_active": False, "last_action": None, "last_error": None,
         "open_time": None,
@@ -445,7 +456,7 @@ def handle_entry(data):
         with state_lock:
             s.update({
                 "in_trade": True, "pending": False,
-                "entry_price": entry, "backup_sl": sl, "tp_price": tp,
+                "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
                 "qty": qty, "order_id": order["id"], "sl_order_id": sl_id,
                 "open_time": datetime.utcnow().isoformat(),
             })
@@ -476,7 +487,7 @@ def handle_pending_entry(data):
             with state_lock:
                 s.update({
                     "in_trade": True, "pending": False,
-                    "entry_price": current, "backup_sl": sl, "tp_price": tp,
+                    "entry_price": current, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
                     "qty": qty, "order_id": order["id"], "sl_order_id": sl_id,
                     "open_time": datetime.utcnow().isoformat(),
                 })
@@ -486,10 +497,11 @@ def handle_pending_entry(data):
         with state_lock:
             s.update({
                 "pending": True,
-                "entry_price": entry, "backup_sl": sl, "tp_price": tp,
+                "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
                 "qty": qty, "order_id": order["id"],
                 "open_time": datetime.utcnow().isoformat(),
             })
+            save_state(symbol, s)
         log_action(symbol, "PENDING_ENTRY", f"entry={entry}")
         return {"status": "ok"}
     except Exception as e:
@@ -510,10 +522,11 @@ def handle_entry_filled(data):
         with state_lock:
             s.update({
                 "in_trade": True, "pending": False,
-                "entry_price": entry, "backup_sl": sl, "tp_price": tp,
+                "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
                 "qty": qty, "order_id": order["id"], "sl_order_id": sl_id,
                 "open_time": datetime.utcnow().isoformat(),
             })
+            save_state(symbol, s)
         log_action(symbol, "ENTRY_FILLED", f"entry={entry} sl_prev={sl}")
         return {"status": "ok"}
     except Exception as e:
@@ -539,8 +552,9 @@ def handle_exit(data):
             return {"status": "warning", "reason": "لا يوجد رصيد"}
         sell = market_sell(symbol, qty)
         save_trade(symbol, s.get("entry_price"), exit_price, reason, qty, pnl,
-                   sl=s.get("backup_sl"), tp=s.get("tp_price"),
-                   open_time=s.get("open_time"))
+                   sl=s.get("initial_sl") or s.get("backup_sl"),
+                   current_sl=s.get("current_sl") or s.get("backup_sl"),
+                   tp=s.get("tp_price"), open_time=s.get("open_time"))
         reset_symbol(symbol)
         log_action(symbol, "EXIT", f"reason={reason}")
         return {"status": "ok"}
@@ -557,6 +571,8 @@ def handle_update_backup_sl(data):
     if s["pending"]:
         with state_lock:
             s["backup_sl"] = new_sl
+            s["current_sl"] = new_sl
+            s["initial_sl"] = new_sl
             save_state(symbol, s)
         log_action(symbol, "UPDATE_BACKUP_SL_PENDING", f"SL={new_sl}")
         return {"status": "ok"}
@@ -565,6 +581,7 @@ def handle_update_backup_sl(data):
         sl_id = place_stop_loss(symbol, s["qty"], new_sl)
         with state_lock:
             s["backup_sl"] = new_sl
+            s["current_sl"] = new_sl
             s["be_active"] = True
             s["sl_order_id"] = sl_id
             save_state(symbol, s)
@@ -718,73 +735,81 @@ def metric_row(label, value, cls=""):
 
 @app.route("/", methods=["GET"])
 def dashboard():
+    mode_txt = '🧪 PAPER' if 'paper-api' in ALPACA_BASE_URL else '🔴 LIVE'
     now = datetime.utcnow()
-    trades = load_trades(500)
-    signals = load_signal_events(60)
-    actions = load_action_events(60)
+    trades = load_trades(300)
+    signals = load_signal_events(20)
+
     today = [t for t in trades if trade_dt(t, "close_time") and trade_dt(t, "close_time").date() == now.date()]
-    last7 = [t for t in trades if trade_dt(t, "close_time") and trade_dt(t, "close_time") >= now - timedelta(days=7)]
-    m_all = calc_trade_metrics(trades); m_today = calc_trade_metrics(today); m_7 = calc_trade_metrics(last7)
+    m_all = calc_trade_metrics(trades)
+    m_today = calc_trade_metrics(today)
+
     active_symbols = [sym for sym, st in states.items() if st.get("in_trade") or st.get("pending")]
-    active_count = len([sym for sym in active_symbols if states[sym].get("in_trade")]); pending_count = len([sym for sym in active_symbols if states[sym].get("pending")])
-    error_count = len([sym for sym, st in states.items() if st.get("last_error")])
+    active_count = len([sym for sym in active_symbols if states[sym].get("in_trade")])
+    pending_count = len([sym for sym in active_symbols if states[sym].get("pending")])
     pf_value = "∞" if m_all["profit_factor"] is None and m_all["gross_profit"] > 0 else fmt_num(m_all["profit_factor"], 2)
+
     top_stats = "".join([
-        stat_card("إجمالي P&L", fmt_money(m_all["total_pnl"]), "كل الصفقات", "green" if m_all["total_pnl"] >= 0 else "red"),
-        stat_card("صفقات مغلقة", str(m_all["total"]), f"اليوم {m_today['total']} · 7 أيام {m_7['total']}"),
-        stat_card("Win Rate", pct(m_all["win_rate"], 1), f"ربح {m_all['wins']} / خسارة {m_all['losses']}"),
-        stat_card("Profit Factor", pf_value, "Gross Profit ÷ Gross Loss"),
-        stat_card("TP / BE / SL", f"{m_all['tp']} / {m_all['be']} / {m_all['sl']}", "توزيع الخروج"),
-        stat_card("Avg R", fmt_num(m_all["avg_rr"], 2), "متوسط R الفعلي"),
-        stat_card("Today P&L", fmt_money(m_today["total_pnl"]), f"صفقات اليوم {m_today['total']}", "green" if m_today["total_pnl"] >= 0 else "red"),
-        stat_card("7D P&L", fmt_money(m_7["total_pnl"]), f"صفقات 7 أيام {m_7['total']}", "green" if m_7["total_pnl"] >= 0 else "red"),
-        stat_card("Active / Pending", f"{active_count} / {pending_count}", "مفتوحة / انتظار", "yellow" if active_count or pending_count else ""),
-        stat_card("Errors", str(error_count), "رموز لديها آخر خطأ", "red" if error_count else "green"),
-        stat_card("Best / Worst", f"{fmt_money(m_all['best'])} / {fmt_money(m_all['worst'])}", "أفضل وأسوأ صفقة"),
-        stat_card("Avg Duration", (f"{m_all['avg_duration']:.0f} دقيقة" if m_all["avg_duration"] is not None else "—"), "متوسط مدة الصفقة"),
+        stat_card("Net P&L", fmt_money(m_all["total_pnl"]), f"Today {fmt_money(m_today['total_pnl'])}", "green" if m_all["total_pnl"] >= 0 else "red"),
+        stat_card("Trades", str(m_all["total"]), f"Today {m_today['total']}", ""),
+        stat_card("Win Rate", pct(m_all["win_rate"], 1), f"W {m_all['wins']} / L {m_all['losses']}", ""),
+        stat_card("PF", pf_value, "Profit factor", ""),
+        stat_card("TP/BE/SL", f"{m_all['tp']}/{m_all['be']}/{m_all['sl']}", "خروج الصفقات", ""),
+        stat_card("Avg R", fmt_num(m_all["avg_rr"], 2), "based on initial SL", ""),
+        stat_card("Open/Pending", f"{active_count}/{pending_count}", "نشط / انتظار", "yellow" if active_count or pending_count else ""),
     ])
-    if not active_symbols:
-        active_html = '<div class="empty">لا توجد صفقات نشطة الآن</div>'
-    else:
-        cards=[]
-        for sym in active_symbols:
-            st=states[sym]; entry=safe_float(st.get("entry_price")); sl=safe_float(st.get("backup_sl")); tp=safe_float(st.get("tp_price")); qty=safe_float(st.get("qty"),0.0); current=get_current_price(sym)
-            risk_unit=entry-sl if entry is not None and sl is not None else None; reward_unit=tp-entry if tp is not None and entry is not None else None
-            risk_cash=risk_unit*qty if risk_unit is not None and qty else None; reward_cash=reward_unit*qty if reward_unit is not None and qty else None
-            planned_rr=reward_unit/risk_unit if risk_unit and risk_unit>0 and reward_unit is not None else None; live_pnl=(current-entry)*qty if current is not None and entry is not None and qty else None
-            live_r=live_pnl/risk_cash if live_pnl is not None and risk_cash and risk_cash>0 else None
-            dist_sl_pct=((current-sl)/current*100) if current and sl else None; dist_tp_pct=((tp-current)/current*100) if current and tp else None
-            open_dt=safe_dt(st.get("open_time")); age=int((now-open_dt).total_seconds()/60) if open_dt else None
-            status_txt="🟢 صفقة مفتوحة" if st.get("in_trade") else "🟡 أمر معلّق"; status_cls="green" if st.get("in_trade") else "yellow"
-            cards.append(f'''<div class="position-card"><div class="position-head"><b>{escape(sym)}</b><span class="pill {status_cls}">{status_txt}</span></div>
-            {metric_row('السعر الحالي', fmt_num(current,8))}{metric_row('الدخول', fmt_num(entry,8))}{metric_row('SL', fmt_num(sl,8),'red')}{metric_row('TP', fmt_num(tp,8),'green')}{metric_row('الكمية', fmt_num(qty,8))}
-            {metric_row('Risk $ / Reward $', f"{fmt_money(risk_cash)} / {fmt_money(reward_cash)}")}{metric_row('Planned RR', fmt_num(planned_rr,2))}{metric_row('Live P&L / R', f"{fmt_money(live_pnl)} / {fmt_num(live_r,2)}R", 'green' if (live_pnl or 0)>=0 else 'red')}
-            {metric_row('بعده عن SL / TP', f"{pct(dist_sl_pct)} / {pct(dist_tp_pct)}")}{metric_row('العمر', f"{age} دقيقة" if age is not None else '—')}{metric_row('آخر إجراء', escape(str(st.get('last_action') or '—')))}{metric_row('آخر خطأ', escape(str(st.get('last_error') or '—')), 'red')}</div>''')
-        active_html='<div class="positions-grid">'+''.join(cards)+'</div>'
-    by_symbol={}
-    for t in trades: by_symbol.setdefault(t.get("symbol") or "?",[]).append(t)
-    symbol_rows=""
-    for sym, rows_t in sorted(by_symbol.items(), key=lambda kv: calc_trade_metrics(kv[1])["total_pnl"], reverse=True):
-        m=calc_trade_metrics(rows_t); cls="green" if m["total_pnl"]>=0 else "red"
-        symbol_rows += f'''<tr><td><b>{escape(str(sym))}</b></td><td>{m['total']}</td><td class="{cls}">{fmt_money(m['total_pnl'])}</td><td>{pct(m['win_rate'],1)}</td><td>{fmt_num(m['profit_factor'],2) if m['profit_factor'] is not None else '∞'}</td><td>{m['tp']} / {m['be']} / {m['sl']}</td><td>{fmt_num(m['avg_rr'],2)}</td></tr>'''
-    if not symbol_rows: symbol_rows='<tr><td colspan="7" class="empty">لا توجد صفقات مغلقة بعد</td></tr>'
-    trade_rows=""
-    for t in trades[:80]:
-        pnl_val=safe_float(t.get("pnl"),0.0); cls="green" if pnl_val>=0 else "red"; ct=trade_dt(t,"close_time"); ct_str=ct.strftime("%m-%d %H:%M") if ct else "—"
-        trade_rows += f'''<tr><td>{ct_str}</td><td><b>{escape(str(t.get('symbol') or '—'))}</b></td><td>{reason_ar(t.get('exit_reason'))}</td><td>{fmt_num(t.get('entry_price'),8)}</td><td>{fmt_num(t.get('exit_price'),8)}</td><td class="red">{fmt_num(t.get('sl_price'),8)}</td><td class="green">{fmt_num(t.get('tp_price'),8)}</td><td>{fmt_num(t.get('qty'),8)}</td><td class="{cls}">{fmt_money(pnl_val)}</td><td>{pct(t.get('pnl_pct'),2)}</td><td>{fmt_num(t.get('rr_actual'),2)}R</td><td>{t.get('duration_min') or '—'}د</td></tr>'''
-    if not trade_rows: trade_rows='<tr><td colspan="12" class="empty">لا توجد صفقات مغلقة بعد</td></tr>'
-    signal_rows=""
-    for s in signals:
-        status=str(s.get("status") or ""); cls="green" if status in ("ok","success") else "yellow" if status in ("ignored","مكرر","duplicate") else "red" if status=="error" else ""; rt=safe_dt(s.get("received_at")); rt_str=rt.strftime("%m-%d %H:%M:%S") if rt else "—"
-        signal_rows += f'''<tr><td>{rt_str}</td><td><b>{escape(str(s.get('symbol') or '—'))}</b></td><td>{escape(str(s.get('action') or '—'))}</td><td class="{cls}">{escape(status or '—')}</td><td>{fmt_num(s.get('entry_price'),8)}</td><td class="red">{fmt_num(s.get('sl_price'),8)}</td><td class="green">{fmt_num(s.get('tp_price'),8)}</td><td>{fmt_num(s.get('qty'),8)}</td><td>{escape(str(s.get('reason') or '—'))}</td></tr>'''
-    if not signal_rows: signal_rows='<tr><td colspan="9" class="empty">لا توجد إشارات محفوظة بعد</td></tr>'
-    action_rows=""
-    for a in actions[:40]:
-        at=safe_dt(a.get("created_at")); at_str=at.strftime("%m-%d %H:%M:%S") if at else "—"; action_rows += f'''<tr><td>{at_str}</td><td><b>{escape(str(a.get('symbol') or '—'))}</b></td><td>{escape(str(a.get('action') or '—'))}</td><td>{escape(str(a.get('details') or '—'))}</td></tr>'''
-    if not action_rows: action_rows='<tr><td colspan="4" class="empty">لا توجد أحداث بعد</td></tr>'
-    html_page=f'''<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="10"><title>Alpaca Bot v6 Analytics</title><style>
-*{{box-sizing:border-box;margin:0;padding:0}}body{{background:#080910;color:#e6e6ee;font-family:Arial,Tahoma,sans-serif;padding:16px;font-size:12px}}h1{{color:#00ff88;font-size:20px;margin-bottom:6px}}h2{{color:#8d8dff;font-size:14px;margin-bottom:12px}}.sub{{color:#8b8b99;font-size:11px;margin-bottom:16px;line-height:1.8}}.card,.position-card{{background:#12131d;border:1px solid #24263a;border-radius:10px;padding:14px;margin-bottom:14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px;margin-bottom:14px}}.stat{{background:#0d0e17;border:1px solid #24263a;border-radius:9px;padding:12px;text-align:center;min-height:78px}}.stat-val{{font-size:18px;font-weight:800;color:#fff;margin-bottom:4px}}.stat-lbl{{font-size:11px;color:#aaa}}.stat-sub{{font-size:10px;color:#666;margin-top:4px}}.positions-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}}.position-head{{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:15px}}.pill{{border-radius:20px;padding:4px 8px;background:#1b1d2c;font-size:11px}}.row{{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid #202235}}.row:last-child{{border-bottom:none}}.label{{color:#9a9aaa}}.val{{font-weight:bold;color:#fff;text-align:left;direction:ltr}}.green{{color:#00ff88!important}}.red{{color:#ff4d6d!important}}.yellow{{color:#ffd166!important}}.table-wrap{{overflow-x:auto;border-radius:8px;border:1px solid #24263a}}table{{width:100%;border-collapse:collapse;font-size:11px;min-width:850px}}th{{background:#1a1c2b;color:#9ea0ff;padding:8px;text-align:right;white-space:nowrap;position:sticky;top:0}}td{{padding:7px 8px;border-bottom:1px solid #202235;white-space:nowrap}}tr:hover td{{background:#181a28}}.empty{{color:#777;text-align:center;padding:18px}}.footer{{color:#555;font-size:10px;margin-top:14px;text-align:center}}.section-title{{display:flex;justify-content:space-between;align-items:center;margin-top:4px}}.hint{{color:#777;font-size:11px}}
-</style></head><body><h1>⚡ ALPACA BOT v6 · Analytics Dashboard</h1><div class="sub">🧪 Paper/LIVE حسب إعداد ALPACA_BASE_URL · Railway/GitHub · Stocks · تحديث تلقائي كل 10 ثواني</div><div class="grid">{top_stats}</div><div class="section-title"><h2>الصفقات النشطة الآن</h2><span class="hint">السعر الحالي والربح الحي والمسافة من SL/TP</span></div>{active_html}<div class="card"><div class="section-title"><h2>تحليل الأداء حسب السهم</h2><span class="hint">يعرفك أقوى الرموز</span></div><div class="table-wrap"><table><tr><th>السهم</th><th>Trades</th><th>Net P&L</th><th>Win Rate</th><th>PF</th><th>TP/BE/SL</th><th>Avg R</th></tr>{symbol_rows}</table></div></div><div class="card"><div class="section-title"><h2>سجل الصفقات التفصيلي</h2><span class="hint">آخر 80 صفقة</span></div><div class="table-wrap"><table><tr><th>وقت الخروج</th><th>سهم</th><th>النتيجة</th><th>دخول</th><th>خروج</th><th>SL</th><th>TP</th><th>Qty</th><th>P&L</th><th>%</th><th>R</th><th>مدة</th></tr>{trade_rows}</table></div></div><div class="card"><div class="section-title"><h2>سجل إشارات TradingView Webhook</h2><span class="hint">هل وصلت/تكررت/انرفضت/تنفذت</span></div><div class="table-wrap"><table><tr><th>الوقت</th><th>سهم</th><th>Action</th><th>Status</th><th>Entry</th><th>SL</th><th>TP</th><th>Qty</th><th>Reason/Error</th></tr>{signal_rows}</table></div></div><div class="card"><div class="section-title"><h2>آخر أحداث البوت</h2><span class="hint">تنفيذ، إلغاء، تحديث SL، أخطاء</span></div><div class="table-wrap"><table><tr><th>الوقت</th><th>سهم</th><th>Action</th><th>Details</th></tr>{action_rows}</table></div></div><p class="footer">V6 Analytics · لا يعرض مفاتيح API أو أسرار الويب هوك</p></body></html>'''
+
+    active_rows = ""
+    for sym in active_symbols:
+        st = states[sym]
+        entry = safe_float(st.get("entry_price")); initial_sl = safe_float(st.get("initial_sl") or st.get("backup_sl")); current_sl = safe_float(st.get("current_sl") or st.get("backup_sl")); tp = safe_float(st.get("tp_price")); qty = safe_float(st.get("qty"), 0.0)
+        current = get_current_price(sym)
+        risk_cash = (entry - initial_sl) * qty if entry is not None and initial_sl is not None and qty else None
+        live_pnl = (current - entry) * qty if current is not None and entry is not None and qty else None
+        live_r = live_pnl / risk_cash if live_pnl is not None and risk_cash and risk_cash > 0 else None
+        status = "OPEN" if st.get("in_trade") else "PENDING"
+        cls = "green" if st.get("in_trade") else "yellow"
+        active_rows += f'''<tr><td><b>{escape(sym)}</b></td><td class="{cls}">{status}</td><td>{fmt_num(current,8)}</td><td>{fmt_num(entry,8)}</td><td class="red">{fmt_num(initial_sl,8)}</td><td class="yellow">{fmt_num(current_sl,8)}</td><td class="green">{fmt_num(tp,8)}</td><td>{fmt_num(qty,8)}</td><td class="{'green' if (live_pnl or 0)>=0 else 'red'}">{fmt_money(live_pnl)}</td><td>{fmt_num(live_r,2)}R</td><td>{escape(str(st.get('last_action') or '—'))}</td></tr>'''
+    if not active_rows:
+        active_rows = '<tr><td colspan="11" class="empty">لا توجد صفقات نشطة الآن</td></tr>'
+
+    by_symbol = {}
+    for t in trades:
+        by_symbol.setdefault(t.get("symbol") or "?", []).append(t)
+    symbol_rows = ""
+    for sym, rows_t in sorted(by_symbol.items(), key=lambda kv: calc_trade_metrics(kv[1])["total_pnl"], reverse=True)[:10]:
+        m = calc_trade_metrics(rows_t); cls = "green" if m["total_pnl"] >= 0 else "red"
+        symbol_rows += f'''<tr><td><b>{escape(str(sym))}</b></td><td>{m['total']}</td><td class="{cls}">{fmt_money(m['total_pnl'])}</td><td>{pct(m['win_rate'],1)}</td><td>{fmt_num(m['profit_factor'],2) if m['profit_factor'] is not None else '∞'}</td><td>{m['tp']}/{m['be']}/{m['sl']}</td><td>{fmt_num(m['avg_rr'],2)}</td></tr>'''
+    if not symbol_rows:
+        symbol_rows = '<tr><td colspan="7" class="empty">لا توجد صفقات مغلقة بعد</td></tr>'
+
+    trade_rows = ""
+    for t in trades[:25]:
+        pnl_val = safe_float(t.get("pnl"), 0.0); cls = "green" if pnl_val >= 0 else "red"; ct = trade_dt(t, "close_time"); ct_str = ct.strftime("%m-%d %H:%M") if ct else "—"
+        init_sl = t.get('initial_sl_price') if t.get('initial_sl_price') is not None else t.get('sl_price')
+        cur_sl = t.get('current_sl_price') if t.get('current_sl_price') is not None else t.get('sl_price')
+        trade_rows += f'''<tr><td>{ct_str}</td><td><b>{escape(str(t.get('symbol') or '—'))}</b></td><td>{reason_ar(t.get('exit_reason'))}</td><td>{fmt_num(t.get('entry_price'),8)}</td><td>{fmt_num(t.get('exit_price'),8)}</td><td class="red">{fmt_num(init_sl,8)}</td><td class="yellow">{fmt_num(cur_sl,8)}</td><td class="green">{fmt_num(t.get('tp_price'),8)}</td><td class="{cls}">{fmt_money(pnl_val)}</td><td>{fmt_num(t.get('rr_actual'),2)}R</td><td>{t.get('duration_min') or '—'}د</td></tr>'''
+    if not trade_rows:
+        trade_rows = '<tr><td colspan="11" class="empty">لا توجد صفقات مغلقة بعد</td></tr>'
+
+    signal_rows = ""
+    for s in signals[:12]:
+        status = str(s.get("status") or ""); cls = "green" if status in ("ok","success") else "yellow" if status in ("ignored","مكرر","duplicate") else "red" if status == "error" else ""; rt = safe_dt(s.get("received_at")); rt_str = rt.strftime("%H:%M:%S") if rt else "—"
+        signal_rows += f'''<tr><td>{rt_str}</td><td><b>{escape(str(s.get('symbol') or '—'))}</b></td><td>{escape(str(s.get('action') or '—'))}</td><td class="{cls}">{escape(status or '—')}</td><td>{fmt_num(s.get('entry_price'),8)}</td><td>{fmt_num(s.get('qty'),8)}</td><td>{escape(str(s.get('reason') or '—'))}</td></tr>'''
+    if not signal_rows:
+        signal_rows = '<tr><td colspan="7" class="empty">لا توجد إشارات بعد</td></tr>'
+
+    html_page = f'''<!DOCTYPE html><html dir="rtl" lang="ar"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="10">
+<title>Renko Bot Simple</title><style>
+*{{box-sizing:border-box;margin:0;padding:0}}body{{background:#080910;color:#e6e6ee;font-family:Arial,Tahoma,sans-serif;padding:14px;font-size:12px}}h1{{color:#00ff88;font-size:18px;margin-bottom:4px}}h2{{color:#9ea0ff;font-size:13px;margin:6px 0 10px}}.sub{{color:#888;font-size:11px;margin-bottom:12px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}}.stat{{background:#0d0e17;border:1px solid #24263a;border-radius:8px;padding:9px;text-align:center;min-height:62px}}.stat-val{{font-size:15px;font-weight:800;color:#fff}}.stat-lbl{{font-size:10px;color:#aaa;margin-top:3px}}.stat-sub{{font-size:9px;color:#666;margin-top:3px}}.card{{background:#12131d;border:1px solid #24263a;border-radius:9px;padding:10px;margin-bottom:10px}}.table-wrap{{overflow-x:auto;border-radius:7px;border:1px solid #24263a}}table{{width:100%;border-collapse:collapse;font-size:11px;min-width:760px}}th{{background:#1a1c2b;color:#9ea0ff;padding:7px;text-align:right;white-space:nowrap}}td{{padding:6px 7px;border-bottom:1px solid #202235;white-space:nowrap}}.green{{color:#00ff88!important}}.red{{color:#ff4d6d!important}}.yellow{{color:#ffd166!important}}.empty{{color:#777;text-align:center;padding:14px}}.footer{{color:#555;text-align:center;font-size:10px;margin-top:10px}}
+</style></head><body>
+<h1>⚡ ALPACA BOT · Simple Dashboard</h1><div class="sub">{mode_txt} · Alpaca Stocks · تحديث كل 10 ثواني · مختصر للتحليل السريع</div><div class="grid">{top_stats}</div>
+<div class="card"><h2>الصفقات النشطة</h2><div class="table-wrap"><table><tr><th>سهم</th><th>حالة</th><th>السعر</th><th>دخول</th><th>Initial SL</th><th>Current SL</th><th>TP</th><th>Qty</th><th>Live P&L</th><th>Live R</th><th>آخر إجراء</th></tr>{active_rows}</table></div></div>
+<div class="card"><h2>الأداء حسب السهم</h2><div class="table-wrap"><table><tr><th>سهم</th><th>Trades</th><th>Net</th><th>Win%</th><th>PF</th><th>TP/BE/SL</th><th>Avg R</th></tr>{symbol_rows}</table></div></div>
+<div class="card"><h2>آخر الصفقات</h2><div class="table-wrap"><table><tr><th>وقت</th><th>سهم</th><th>نتيجة</th><th>دخول</th><th>خروج</th><th>Initial SL</th><th>Current SL</th><th>TP</th><th>P&L</th><th>R</th><th>مدة</th></tr>{trade_rows}</table></div></div>
+<div class="card"><h2>آخر إشارات Webhook</h2><div class="table-wrap"><table><tr><th>وقت</th><th>سهم</th><th>Action</th><th>Status</th><th>Entry</th><th>Qty</th><th>Reason</th></tr>{signal_rows}</table></div></div>
+<p class="footer">V8 Simple · R محسوب من Initial SL للصفقات الجديدة فقط</p></body></html>'''
     return html_page
 
 # ====================================================================
