@@ -1,5 +1,5 @@
 """
-Alpaca Stocks Bot - V15 FINAL PENDING ONLY v13 FULL PROTECTION + SIMPLE DASHBOARD Railway/GitHub
+Alpaca Stocks Bot - V28 (V27 + pending TTL + no zero-qty liquidation)
 + قاعدة بيانات PostgreSQL كاملة
 + Fast Webhook ACK: يرد فوراً ثم ينفذ الإشارة في الخلفية
 """
@@ -70,6 +70,130 @@ MIRROR_REJECT_IF_NO_PRICE = os.environ.get("MIRROR_REJECT_IF_NO_PRICE", "true").
 PENDING_ONLY_ENTRY = os.environ.get("PENDING_ONLY_ENTRY", "true").lower() == "true"
 REJECT_IF_ENTRY_ALREADY_PASSED = os.environ.get("REJECT_IF_ENTRY_ALREADY_PASSED", "true").lower() == "true"
 NEAR_ENTRY_TOLERANCE_PCT = env_float("NEAR_ENTRY_TOLERANCE_PCT", 0.05)  # if live is slightly above entry, place LIMIT bracket at entry instead of rejecting
+
+# ====================================================================
+# BOT-SIDE BREAKEVEN GUARD
+# ====================================================================
+# Independent BE system inside the bot. It does not wait for TradingView UPDATE_BACKUP_SL.
+# When live price reaches +BOT_BE_TRIGGER_R, the bot moves broker-side SL to entry + BOT_BE_LOCK_R.
+BOT_BE_ENABLED = os.environ.get("BOT_BE_ENABLED", "true").lower() == "true"
+BOT_BE_TRIGGER_R = env_float("BOT_BE_TRIGGER_R", 0.30)
+BOT_BE_LOCK_R = env_float("BOT_BE_LOCK_R", 0.00)
+BOT_BE_UPDATE_BROKER = os.environ.get("BOT_BE_UPDATE_BROKER", "true").lower() == "true"
+MONITOR_INTERVAL_SEC = env_float("MONITOR_INTERVAL_SEC", 1.0)
+# V28: safety expiry for broker pending orders if TradingView CANCEL is missed. 0 = disabled.
+PENDING_MAX_AGE_MIN = env_float("PENDING_MAX_AGE_MIN", 180.0)
+
+# V20 FINAL HARDENED: broker reconcile checks the broker itself, not only bot memory.
+BROKER_RECONCILE_ENABLED = os.environ.get("BROKER_RECONCILE_ENABLED", "true").lower() == "true"
+RECONCILE_UNPROTECTED_ACTION = os.environ.get("RECONCILE_UNPROTECTED_ACTION", "CLOSE").upper()  # CLOSE or REPROTECT
+EXECUTION_ERROR_R_THRESHOLD = env_float("EXECUTION_ERROR_R_THRESHOLD", -1.05)
+
+
+# ====================================================================
+# SINGLE VARIABLE CONFIG OVERRIDE
+# ====================================================================
+# بدل ما تضيف Variables كثيرة في Railway، تقدر تضيف متغير واحد فقط:
+# BOT_SETTINGS=mirror=true;max_dev=0.05;near=0.05;protect=true;be=true;be_trigger=0.30;be_lock=0.00;monitor=1;reconcile=true;unprotected=CLOSE;exec_err_r=-1.05
+# يدعم أيضاً JSON لو تحب لاحقاً.
+def _bot_bool(v, default=False):
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _bot_float(v, default):
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return default
+
+def _load_bot_settings():
+    raw = os.environ.get("BOT_SETTINGS", "").strip()
+    if not raw:
+        return {}
+    try:
+        if raw.startswith("{"):
+            obj = json.loads(raw)
+            return {str(k).strip().lower(): v for k, v in obj.items()}
+    except Exception:
+        pass
+    out = {}
+    for part in raw.replace("\n", ";").replace(",", ";").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        out[k.strip().lower()] = v.strip()
+    return out
+
+def _apply_bot_settings():
+    global NET_FILTER_ENABLED, MIN_RISK_PCT, MIN_NET_RR, FEE_RATE_PER_SIDE, SLIPPAGE_PCT_RT, FIXED_COST_RT
+    global BROKER_PROTECTION_MODE, REQUIRE_BROKER_PROTECTION
+    global BACKTEST_MIRROR_MODE, MAX_ENTRY_DEVIATION_PCT, REJECT_IF_PRICE_BEYOND_SL_TP, MIRROR_REJECT_IF_NO_PRICE
+    global PENDING_ONLY_ENTRY, REJECT_IF_ENTRY_ALREADY_PASSED, NEAR_ENTRY_TOLERANCE_PCT
+    global BOT_BE_ENABLED, BOT_BE_TRIGGER_R, BOT_BE_LOCK_R, BOT_BE_UPDATE_BROKER, MONITOR_INTERVAL_SEC, PENDING_MAX_AGE_MIN
+    global BROKER_RECONCILE_ENABLED, RECONCILE_UNPROTECTED_ACTION, EXECUTION_ERROR_R_THRESHOLD
+    cfg = _load_bot_settings()
+    if not cfg:
+        return
+
+    # aliases عربية/مختصرة بالإنجليزي
+    if "net" in cfg or "net_filter" in cfg:
+        NET_FILTER_ENABLED = _bot_bool(cfg.get("net", cfg.get("net_filter")), NET_FILTER_ENABLED)
+    if "min_risk" in cfg:
+        MIN_RISK_PCT = _bot_float(cfg.get("min_risk"), MIN_RISK_PCT)
+    if "min_net_rr" in cfg:
+        MIN_NET_RR = _bot_float(cfg.get("min_net_rr"), MIN_NET_RR)
+    if "fee" in cfg:
+        FEE_RATE_PER_SIDE = _bot_float(cfg.get("fee"), FEE_RATE_PER_SIDE)
+    if "slippage" in cfg:
+        SLIPPAGE_PCT_RT = _bot_float(cfg.get("slippage"), SLIPPAGE_PCT_RT)
+    if "fixed_cost" in cfg:
+        FIXED_COST_RT = _bot_float(cfg.get("fixed_cost"), FIXED_COST_RT)
+
+    if "broker" in cfg:
+        BROKER_PROTECTION_MODE = str(cfg.get("broker")).strip().upper()
+    if "protect" in cfg or "require_protection" in cfg:
+        REQUIRE_BROKER_PROTECTION = _bot_bool(cfg.get("protect", cfg.get("require_protection")), REQUIRE_BROKER_PROTECTION)
+
+    if "mirror" in cfg:
+        BACKTEST_MIRROR_MODE = _bot_bool(cfg.get("mirror"), BACKTEST_MIRROR_MODE)
+    if "max_dev" in cfg:
+        MAX_ENTRY_DEVIATION_PCT = _bot_float(cfg.get("max_dev"), MAX_ENTRY_DEVIATION_PCT)
+    if "reject_sl_tp" in cfg:
+        REJECT_IF_PRICE_BEYOND_SL_TP = _bot_bool(cfg.get("reject_sl_tp"), REJECT_IF_PRICE_BEYOND_SL_TP)
+    if "reject_no_price" in cfg:
+        MIRROR_REJECT_IF_NO_PRICE = _bot_bool(cfg.get("reject_no_price"), MIRROR_REJECT_IF_NO_PRICE)
+
+    if "pending" in cfg:
+        PENDING_ONLY_ENTRY = _bot_bool(cfg.get("pending"), PENDING_ONLY_ENTRY)
+    if "reject_passed" in cfg:
+        REJECT_IF_ENTRY_ALREADY_PASSED = _bot_bool(cfg.get("reject_passed"), REJECT_IF_ENTRY_ALREADY_PASSED)
+    if "near" in cfg:
+        NEAR_ENTRY_TOLERANCE_PCT = _bot_float(cfg.get("near"), NEAR_ENTRY_TOLERANCE_PCT)
+
+    if "be" in cfg:
+        BOT_BE_ENABLED = _bot_bool(cfg.get("be"), BOT_BE_ENABLED)
+    if "be_trigger" in cfg:
+        BOT_BE_TRIGGER_R = _bot_float(cfg.get("be_trigger"), BOT_BE_TRIGGER_R)
+    if "be_lock" in cfg:
+        BOT_BE_LOCK_R = _bot_float(cfg.get("be_lock"), BOT_BE_LOCK_R)
+    if "be_update" in cfg:
+        BOT_BE_UPDATE_BROKER = _bot_bool(cfg.get("be_update"), BOT_BE_UPDATE_BROKER)
+    if "monitor" in cfg:
+        MONITOR_INTERVAL_SEC = _bot_float(cfg.get("monitor"), MONITOR_INTERVAL_SEC)
+    if "pending_expiry" in cfg:
+        PENDING_MAX_AGE_MIN = _bot_float(cfg.get("pending_expiry"), PENDING_MAX_AGE_MIN)
+
+
+    if "reconcile" in cfg:
+        BROKER_RECONCILE_ENABLED = _bot_bool(cfg.get("reconcile"), BROKER_RECONCILE_ENABLED)
+    if "unprotected" in cfg:
+        RECONCILE_UNPROTECTED_ACTION = str(cfg.get("unprotected")).strip().upper()
+    if "exec_err_r" in cfg:
+        EXECUTION_ERROR_R_THRESHOLD = _bot_float(cfg.get("exec_err_r"), EXECUTION_ERROR_R_THRESHOLD)
+
+_apply_bot_settings()
 
 
 
@@ -460,12 +584,28 @@ def alpaca_delete(endpoint):
         r.raise_for_status()
     return True
 
-def get_current_price(symbol):
+# V21: price cache بـ TTL لتقليل نداءات Alpaca API ومنع rate limit
+_price_cache = {}
+_price_cache_lock = threading.Lock()
+try:
+    PRICE_CACHE_TTL = float(os.environ.get("PRICE_CACHE_TTL", "0.8"))
+except Exception:
+    PRICE_CACHE_TTL = 0.8
+
+def get_current_price(symbol, force=False):
+    now = time_module.time()
+    with _price_cache_lock:
+        cached = _price_cache.get(symbol)
+    if cached and not force and (now - cached[1]) <= PRICE_CACHE_TTL:
+        return cached[0]
     try:
         r = requests.get(f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest", headers=HEADERS, timeout=10)
-        return float(r.json()["quote"]["ap"])
+        price = float(r.json()["quote"]["ap"])
+        with _price_cache_lock:
+            _price_cache[symbol] = (price, now)
+        return price
     except:
-        return None
+        return cached[0] if cached else None
 
 def backtest_mirror_check(symbol, entry, sl, tp, mode="market"):
     """Return (ok, reason, current).
@@ -606,7 +746,8 @@ def place_broker_exit_protection(symbol, qty, sl_price, tp_price):
 def emergency_close_unprotected(symbol, qty, reason="NO_BROKER_PROTECTION"):
     try:
         actual_qty = get_position_qty(symbol)
-        sell_qty = actual_qty if actual_qty > 0 else float(qty or 0)
+        bot_qty = float(qty or 0)
+        sell_qty = min(bot_qty, actual_qty) if actual_qty > 0 and bot_qty > 0 else bot_qty
         if sell_qty <= 0:
             reset_symbol(symbol)
             return False
@@ -731,7 +872,8 @@ def handle_pending_entry(data):
         # 3) live too far above entry -> reject; no market chasing.
         dev_pct_now = abs(current - entry) / entry * 100.0 if entry else 999.0
 
-        cancel_all_orders(symbol)
+        # V22 SAFETY: do not cancel all broker orders for the symbol before placing a new
+        # pending entry. The bot state already ensures no active bot trade/pending exists.
         if REJECT_IF_ENTRY_ALREADY_PASSED and current >= entry:
             if dev_pct_now <= NEAR_ENTRY_TOLERANCE_PCT:
                 order = place_bracket_limit_buy(symbol, qty, entry, sl, tp)
@@ -772,20 +914,149 @@ def handle_entry_filled(data):
     return handle_pending_entry(data)
 
 
+
+def _sell_verified_pending_fill_alpaca(symbol, filled_qty, reason, exit_price, pnl):
+    """Sell only quantity verified from the bot pending order. Do not sell manual/old holdings."""
+    s = get_state(symbol)
+    try:
+        filled_qty = float(filled_qty or 0)
+        if filled_qty <= 0:
+            s["last_error"] = "verified filled qty <= 0"
+            save_state(symbol, s)
+            return {"status": "pending_fill_qty_invalid"}
+        # Cancel bracket legs for this symbol before liquidation.
+        try:
+            cancel_all_orders(symbol)
+        except Exception as ce:
+            log.warning(f"[{symbol}] cancel orders before verified fill sell warning: {ce}")
+        market_sell(symbol, filled_qty)
+        entry = safe_float(s.get("entry_price"), safe_float(exit_price, 0.0))
+        px = safe_float(exit_price, get_current_price(symbol) or entry)
+        real_pnl = (px - entry) * filled_qty if entry and px else safe_float(pnl, 0.0)
+        save_trade(symbol, entry, px, reason or "EXIT_PENDING_FILLED", filled_qty, real_pnl,
+                   sl=s.get("initial_sl") or s.get("backup_sl"),
+                   current_sl=s.get("current_sl") or s.get("backup_sl"),
+                   tp=s.get("tp_price"), open_time=s.get("open_time"),
+                   trade_quality="PendingRaceClosed")
+        reset_symbol(symbol)
+        log_action(symbol, "PENDING_RACE_FILLED_CLOSED", f"sold_verified_qty={filled_qty}")
+        return {"status": "ok", "note": "sold verified pending fill", "sold": filled_qty}
+    except Exception as e:
+        s["last_error"] = str(e)
+        save_state(symbol, s)
+        log.error(f"[{symbol}] sell verified pending fill failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def _safe_cancel_pending_entry_alpaca(symbol, reason="CANCEL_PENDING", exit_price=None, pnl=0.0, close_if_filled=True):
+    """V24 full pending-race guard for Alpaca bracket/stop/limit entry.
+    If order status cannot be verified, keep state instead of resetting blindly.
+    """
+    s = get_state(symbol)
+    order_id = s.get("order_id")
+    if not order_id:
+        reset_symbol(symbol)
+        log_action(symbol, "PENDING_CANCEL_NO_ORDER_ID_RESET", reason)
+        return {"status": "cancelled_pending", "reason": "no_order_id"}
+
+    def _read_order():
+        return alpaca_get(f"orders/{order_id}")
+
+    try:
+        order = _read_order()
+    except Exception as e:
+        with state_lock:
+            s["last_error"] = f"pending status unknown before cancel: {e}"
+            s["needs_recheck"] = True
+            s["recheck_since"] = datetime.utcnow().isoformat()
+            save_state(symbol, s)
+        log_action(symbol, "PENDING_STATUS_UNKNOWN_KEEP_STATE", str(e))
+        return {"status": "pending_status_unknown_keep_state", "reason": str(e)}
+
+    status = str(order.get("status", "")).lower()
+    filled_qty = safe_float(order.get("filled_qty"), 0.0) or 0.0
+
+    if status in ("filled", "partially_filled") or filled_qty > 0:
+        if status in ("new", "accepted", "pending_new", "partially_filled"):
+            try:
+                alpaca_delete(f"orders/{order_id}")
+            except Exception as ce:
+                log.warning(f"[{symbol}] pending filled/partial cancel remaining warning: {ce}")
+            try:
+                order2 = _read_order()
+                filled_qty = max(filled_qty, safe_float(order2.get("filled_qty"), 0.0) or 0.0)
+            except Exception:
+                pass
+        if close_if_filled:
+            log_action(symbol, "PENDING_WAS_FILLED_ON_CANCEL", f"status={status} qty={filled_qty}")
+            return _sell_verified_pending_fill_alpaca(symbol, filled_qty, reason, exit_price, pnl)
+
+    if status in ("canceled", "expired", "rejected"):
+        reset_symbol(symbol)
+        log_action(symbol, "PENDING_ALREADY_CLOSED_RESET", f"status={status} reason={reason}")
+        return {"status": "cancelled_pending", "reason": f"already_{status}"}
+
+    try:
+        alpaca_delete(f"orders/{order_id}")
+    except Exception as ce:
+        log.warning(f"[{symbol}] pending cancel warning; rechecking order: {ce}")
+
+    try:
+        order_after = _read_order()
+        status_after = str(order_after.get("status", "")).lower()
+        filled_qty = max(filled_qty, safe_float(order_after.get("filled_qty"), 0.0) or 0.0)
+        if filled_qty > 0 or status_after in ("filled", "partially_filled"):
+            log_action(symbol, "PENDING_FILLED_DURING_CANCEL", f"status={status_after} qty={filled_qty}")
+            return _sell_verified_pending_fill_alpaca(symbol, filled_qty, reason, exit_price, pnl)
+        if status_after in ("canceled", "expired", "rejected"):
+            reset_symbol(symbol)
+            log_action(symbol, "EXIT_CANCELLED_PENDING_ONLY", f"status={status_after}; reason={reason}")
+            return {"status": "cancelled_pending", "reason": "exit_received_while_pending_no_sell"}
+        with state_lock:
+            s["last_error"] = f"pending order still {status_after} after cancel attempt"
+            s["needs_recheck"] = True
+            s["recheck_since"] = datetime.utcnow().isoformat()
+            save_state(symbol, s)
+        log_action(symbol, "PENDING_CANCEL_STILL_OPEN_KEEP_STATE", f"status={status_after}")
+        return {"status": "pending_cancel_still_open_keep_state", "reason": status_after}
+    except Exception as e:
+        # V27 SAFETY:
+        # After a cancel attempt, a failed order re-read is not proof that the order was safely cancelled.
+        # V26 could reset here when filled_qty was still 0, which could hide a fill that happened during
+        # the cancel/read race. Keep state in owner-locked quarantine and let reconcile re-check the
+        # bot-owned order_id later. Do not use position-only inference here.
+        with state_lock:
+            s["last_error"] = f"pending post-cancel status unknown after cancel attempt: {e}"
+            s["needs_recheck"] = True
+            s["manual_review"] = True
+            s["recheck_since"] = s.get("recheck_since") or datetime.utcnow().isoformat()
+            save_state(symbol, s)
+        log_action(symbol, "PENDING_POST_CANCEL_UNKNOWN_SAFE_QUARANTINE", str(e))
+        return {"status": "pending_post_cancel_unknown_safe_quarantine", "reason": str(e)}
+
+
 def handle_exit(data):
     symbol     = data.get("symbol")
     reason     = data.get("exit_reason", "?")
     exit_price = float(data.get("exit_price", 0))
     pnl        = float(data.get("pnl", 0))
     s = get_state(symbol)
-    if not s["in_trade"] and not s["pending"]:
+
+    # V24: if EXIT arrives while pending, cancel bot-owned entry safely.
+    # If the entry filled during the race window, close only the verified filled qty.
+    if s.get("pending") and not s.get("in_trade"):
+        return _safe_cancel_pending_entry_alpaca(symbol, reason=reason, exit_price=exit_price, pnl=pnl, close_if_filled=True)
+
+    if not s.get("in_trade"):
         return {"status": "ignored"}
     try:
         cancel_all_orders(symbol)
-        qty = s["qty"]
+        bot_qty = safe_float(s.get("qty"), 0.0)
         actual_qty = get_position_qty(symbol)
-        if actual_qty > 0:
-            qty = actual_qty
+        if bot_qty <= 0:
+            reset_symbol(symbol)
+            return {"status": "warning", "reason": "bot qty invalid"}
+        qty = min(bot_qty, actual_qty) if actual_qty > 0 else bot_qty
         if qty <= 0:
             reset_symbol(symbol)
             return {"status": "warning", "reason": "لا يوجد رصيد"}
@@ -833,13 +1104,17 @@ def handle_update_backup_sl(data):
         s["last_error"] = str(e)
         return {"status": "error", "message": str(e)}
 
+
 def handle_cancel_pending(data):
     symbol = data.get("symbol")
     if not symbol:
         return {"status": "ignored"}
-    cancel_all_orders(symbol)
+    s = get_state(symbol)
+    # V24: cancel safely. If fill raced with cancel, close verified fill.
+    if s.get("pending") and s.get("order_id"):
+        return _safe_cancel_pending_entry_alpaca(symbol, reason=data.get("reason", "CANCEL_PENDING"), exit_price=get_current_price(symbol) or s.get("entry_price"), pnl=0.0, close_if_filled=True)
     reset_symbol(symbol)
-    log_action(symbol, "CANCEL_PENDING")
+    log_action(symbol, "CANCEL_PENDING", "no pending order id; reset state")
     return {"status": "ok"}
 
 
@@ -856,7 +1131,11 @@ def force_market_exit(symbol, reason, exit_price=None):
         if current is None:
             return {"status": "ignored", "reason": "no_price"}
         actual_qty = get_position_qty(symbol)
-        qty = actual_qty if actual_qty > 0 else float(s.get("qty") or 0)
+        bot_qty = safe_float(s.get("qty"), 0.0)
+        if bot_qty <= 0:
+            reset_symbol(symbol)
+            return {"status": "warning", "reason": "bot qty invalid"}
+        qty = min(bot_qty, actual_qty) if actual_qty > 0 else bot_qty
         if qty <= 0:
             reset_symbol(symbol)
             log_action(symbol, "BROKER_FLAT_RESET", "no position qty during guard")
@@ -879,8 +1158,147 @@ def force_market_exit(symbol, reason, exit_price=None):
         log.error(f"[{symbol}] force exit failed: {e}")
         return {"status": "error", "message": str(e)}
 
+
+def broker_reconcile_once():
+    """V25 broker reconcile (with stuck-pending recovery).
+    Checks Alpaca position qty and open orders directly. If the bot thinks a trade is open
+    but Alpaca is flat, the stale state is reset. If a live position has no protection,
+    it is re-protected or closed based on BOT_SETTINGS.
+    """
+    if not BROKER_RECONCILE_ENABLED:
+        return
+
+    # ============================================================
+    # V26: owner-locked stuck-pending recovery
+    # V25 كان يستخدم position fallback لو لم يحسم order status.
+    # هذا ممكن يربط/يغلق مركز يدوي قديم. V26 لا يعتبر المركز ملك البوت
+    # إلا إذا ثبت filled_qty من order_id الخاص بالبوت. غير ذلك SAFE_QUARANTINE.
+    # ============================================================
+    for symbol, st in list(states.items()):
+        if not st.get("needs_recheck"):
+            continue
+        if st.get("in_trade"):
+            with state_lock:
+                s = get_state(symbol)
+                s["needs_recheck"] = False
+                s["manual_review"] = False
+                save_state(symbol, s)
+            continue
+        try:
+            order_id = st.get("order_id")
+            if not order_id:
+                reset_symbol(symbol)
+                log_action(symbol, "RECHECK_RESOLVED_NO_ORDER", "cleared stuck state without order id")
+                continue
+
+            resolved = False
+            status = "unknown"
+            filled_qty = 0.0
+            try:
+                o = alpaca_get(f"orders/{order_id}")
+                status = str(o.get("status", "")).lower()
+                filled_qty = safe_float(o.get("filled_qty"), 0.0) or 0.0
+            except Exception as ge:
+                log.warning(f"[{symbol}] owner-locked recheck order status unknown: {ge}")
+
+            if filled_qty > 0 or status in ("filled", "partially_filled"):
+                try:
+                    if status in ("new", "accepted", "pending_new", "partially_filled"):
+                        alpaca_delete(f"orders/{order_id}")
+                except Exception:
+                    pass
+                pos_qty = get_position_qty(symbol)
+                use_qty = min(filled_qty, pos_qty) if pos_qty and filled_qty else filled_qty
+                if use_qty > 0:
+                    sl = safe_float(st.get("current_sl") or st.get("backup_sl") or st.get("initial_sl"))
+                    tp = safe_float(st.get("tp_price"))
+                    oid = place_broker_exit_protection(symbol, use_qty, sl, tp) if (sl and tp) else None
+                    with state_lock:
+                        s = get_state(symbol)
+                        s.update({"in_trade": True, "pending": False, "needs_recheck": False,
+                                  "manual_review": False, "qty": use_qty, "sl_order_id": oid})
+                        save_state(symbol, s)
+                    if not oid:
+                        emergency_close_unprotected(symbol, use_qty, "RECHECK_FILLED_NO_PROTECTION")
+                    log_action(symbol, "RECHECK_RESOLVED_FILLED_OWNER_LOCKED", f"qty={use_qty} protected={bool(oid)}")
+                    resolved = True
+                else:
+                    # V27: The bot-owned order shows a fill, but Alpaca currently shows no owned position.
+                    # Most likely the bracket already flattened it, or the position is otherwise gone.
+                    # Do not keep this symbol frozen forever.
+                    reset_symbol(symbol)
+                    log_action(symbol, "RECHECK_FILLED_BUT_FLAT_RESET", f"filled_qty={filled_qty} pos_qty={pos_qty}")
+                    resolved = True
+            elif status in ("canceled", "expired", "rejected"):
+                reset_symbol(symbol)
+                log_action(symbol, "RECHECK_RESOLVED_CLOSED", f"status={status}")
+                resolved = True
+
+            if not resolved:
+                with state_lock:
+                    s = get_state(symbol)
+                    s["needs_recheck"] = True
+                    s["manual_review"] = True
+                    s["last_error"] = f"SAFE_QUARANTINE: order {order_id} status={status}; not using position-only recovery"
+                    s["recheck_since"] = s.get("recheck_since") or datetime.utcnow().isoformat()
+                    save_state(symbol, s)
+                log_action(symbol, "RECHECK_SAFE_QUARANTINE", f"order_id={order_id} status={status}; no position-only action")
+        except Exception as e:
+            log.error(f"[{symbol}] owner-locked recheck error: {e}")
+
+    for symbol, st in list(states.items()):
+        if not st.get("in_trade"):
+            continue
+        try:
+            actual_qty = get_position_qty(symbol)
+            entry = safe_float(st.get("entry_price"))
+            sl = safe_float(st.get("current_sl") or st.get("backup_sl") or st.get("initial_sl"))
+            tp = safe_float(st.get("tp_price"))
+            current = get_current_price(symbol)
+
+            if actual_qty <= 0:
+                exit_price = current or tp or sl or entry or 0.0
+                pnl = (exit_price - (entry or exit_price)) * safe_float(st.get("qty"), 0.0)
+                reason = "BROKER_FLAT_RECONCILE"
+                if tp and exit_price >= tp:
+                    reason = "TP_RECONCILE"
+                elif sl and exit_price <= sl:
+                    reason = "SL_RECONCILE"
+                save_trade(symbol, entry or exit_price, exit_price, reason, safe_float(st.get("qty"), 0.0), pnl,
+                           sl=st.get("initial_sl") or st.get("backup_sl"),
+                           current_sl=st.get("current_sl") or st.get("backup_sl"),
+                           tp=st.get("tp_price"), open_time=st.get("open_time"),
+                           trade_quality="BrokerReconcile")
+                reset_symbol(symbol)
+                log_action(symbol, reason, f"alpaca flat; reset stale state price={exit_price}")
+                continue
+
+            try:
+                open_orders = alpaca_get(f"orders?status=open&symbols={symbol}")
+            except Exception:
+                open_orders = []
+
+            if len(open_orders) == 0:
+                if RECONCILE_UNPROTECTED_ACTION == "REPROTECT" and sl and tp:
+                    oid = place_broker_exit_protection(symbol, min(actual_qty, safe_float(st.get("qty"), actual_qty) or actual_qty), sl, tp)
+                    if oid:
+                        with state_lock:
+                            s = get_state(symbol)
+                            s["sl_order_id"] = oid
+                            save_state(symbol, s)
+                        log_action(symbol, "RECONCILE_REPROTECT", f"qty={actual_qty} sl={sl} tp={tp}")
+                        continue
+                emergency_close_unprotected(symbol, min(actual_qty, safe_float(st.get("qty"), actual_qty) or actual_qty), "RECONCILE_UNPROTECTED_CLOSE")
+
+        except Exception as e:
+            log.error(f"[{symbol}] broker reconcile error: {e}")
+
 def protection_guard_once():
-    """Checks all active trades independently from TradingView alerts."""
+    """Checks all active trades independently from TradingView alerts.
+
+    V18 adds bot-side breakeven. This moves the broker-side SL without waiting
+    for TradingView to send UPDATE_BACKUP_SL, which can be late on Renko bars.
+    """
     for symbol, st in list(states.items()):
         if not st.get("in_trade"):
             continue
@@ -888,8 +1306,39 @@ def protection_guard_once():
             current = get_current_price(symbol)
             if current is None:
                 continue
-            sl = st.get("current_sl") or st.get("backup_sl")
-            tp = st.get("tp_price")
+
+            entry = safe_float(st.get("entry_price"))
+            initial_sl = safe_float(st.get("initial_sl") or st.get("backup_sl"))
+            current_sl = safe_float(st.get("current_sl") or st.get("backup_sl"))
+            tp = safe_float(st.get("tp_price"))
+            qty = safe_float(st.get("qty"), 0.0)
+
+            # 0) Bot-side breakeven, before normal guard checks.
+            if (BOT_BE_ENABLED and BOT_BE_UPDATE_BROKER and entry and initial_sl and qty > 0):
+                risk = entry - initial_sl
+                if risk > 0:
+                    trigger_price = entry + risk * BOT_BE_TRIGGER_R
+                    lock_price = entry + risk * BOT_BE_LOCK_R
+                    if tp is not None:
+                        lock_price = min(lock_price, float(tp) - 1e-12)
+                    already_moved = current_sl is not None and current_sl >= lock_price - 1e-12
+                    if current >= trigger_price and lock_price > (current_sl or initial_sl) and not already_moved:
+                        cancel_all_orders(symbol)
+                        sl_id = place_broker_exit_protection(symbol, qty, lock_price, tp)
+                        if not sl_id:
+                            emergency_close_unprotected(symbol, qty, "BE_PROTECTION_FAILED")
+                            continue
+                        with state_lock:
+                            s = get_state(symbol)
+                            s["backup_sl"] = lock_price
+                            s["current_sl"] = lock_price
+                            s["be_active"] = True
+                            s["sl_order_id"] = sl_id
+                            save_state(symbol, s)
+                        log_action(symbol, "BOT_BE_UPDATE", f"trigger={BOT_BE_TRIGGER_R}R lock={BOT_BE_LOCK_R}R SL={lock_price}")
+                        current_sl = lock_price
+
+            sl = current_sl
             if sl is not None and current <= float(sl):
                 force_market_exit(symbol, "GUARD_SL", current)
             elif tp is not None and current >= float(tp):
@@ -903,7 +1352,7 @@ def protection_guard_once():
 def monitor_orders():
     while True:
         try:
-            time_module.sleep(5)
+            time_module.sleep(MONITOR_INTERVAL_SEC)
 
             # 1) Pending order monitor
             for symbol in [s for s, st in list(states.items()) if st.get("pending")]:
@@ -911,10 +1360,20 @@ def monitor_orders():
                 if not s.get("pending") or not s.get("order_id"):
                     continue
                 try:
+                    # V28: expire stale pending broker orders if TradingView cancel was missed.
+                    if PENDING_MAX_AGE_MIN and PENDING_MAX_AGE_MIN > 0:
+                        opened = safe_dt(s.get("open_time"))
+                        if opened and (datetime.utcnow() - opened).total_seconds() > PENDING_MAX_AGE_MIN * 60:
+                            _safe_cancel_pending_entry_alpaca(symbol, reason="BOT_PENDING_EXPIRED", exit_price=get_current_price(symbol) or s.get("entry_price"), pnl=0.0, close_if_filled=True)
+                            continue
                     order = alpaca_get(f"orders/{s['order_id']}")
                     status = order.get("status", "")
-                    if status == "filled":
-                        actual_qty = float(order.get("filled_qty", s["qty"]))
+                    filled_qty = safe_float(order.get("filled_qty"), 0.0) or 0.0
+                    status_l = str(status).lower()
+                    if status_l in ("filled", "partially_filled") or filled_qty > 0:
+                        # V24: track/protect partial fills too. Alpaca bracket legs usually protect fills,
+                        # but we still mark the actual filled quantity immediately.
+                        actual_qty = filled_qty if filled_qty > 0 else float(order.get("filled_qty", s["qty"]))
                         sl_id = s.get("sl_order_id") or s.get("order_id")
                         with state_lock:
                             s.update({
@@ -923,13 +1382,14 @@ def monitor_orders():
                                 "open_time": datetime.utcnow().isoformat(),
                             })
                             save_state(symbol, s)
-                        log_action(symbol, "PENDING_FILLED", f"qty={actual_qty}")
-                    elif status in ("canceled", "expired", "rejected"):
+                        log_action(symbol, "PENDING_FILLED", f"status={status_l} qty={actual_qty}")
+                    elif status_l in ("canceled", "expired", "rejected"):
                         reset_symbol(symbol)
                 except Exception as e:
                     log.error(f"[{symbol}] pending monitor: {e}")
 
-            # 2) Independent broker protection guard for active trades
+            # 2) Broker reconcile + independent broker protection guard for active trades
+            broker_reconcile_once()
             protection_guard_once()
 
         except Exception as e:
