@@ -69,6 +69,7 @@ MIRROR_REJECT_IF_NO_PRICE = os.environ.get("MIRROR_REJECT_IF_NO_PRICE", "true").
 # bracket at TradingView entry. If price already passed entry, reject the signal.
 PENDING_ONLY_ENTRY = os.environ.get("PENDING_ONLY_ENTRY", "true").lower() == "true"
 REJECT_IF_ENTRY_ALREADY_PASSED = os.environ.get("REJECT_IF_ENTRY_ALREADY_PASSED", "true").lower() == "true"
+NEAR_ENTRY_TOLERANCE_PCT = env_float("NEAR_ENTRY_TOLERANCE_PCT", 0.05)  # if live is slightly above entry, place LIMIT bracket at entry instead of rejecting
 
 
 
@@ -558,6 +559,24 @@ def place_bracket_stop_buy(symbol, qty, entry_price, sl_price, tp_price):
     }
     return alpaca_post("orders", payload)
 
+
+def place_bracket_limit_buy(symbol, qty, entry_price, sl_price, tp_price):
+    """Alpaca broker-side bracket for a buy-limit entry.
+    Used when live price is slightly above/equal to TradingView entry, so we wait for a retest instead of chasing market.
+    """
+    payload = {
+        "symbol": symbol,
+        "qty": str(round(float(qty), 6)),
+        "side": "buy",
+        "type": "limit",
+        "limit_price": round_price_4(entry_price),
+        "time_in_force": "day",
+        "order_class": "bracket",
+        "take_profit": {"limit_price": round_price_4(tp_price)},
+        "stop_loss": {"stop_price": round_price_4(sl_price)},
+    }
+    return alpaca_post("orders", payload)
+
 def place_oco_exit(symbol, qty, sl_price, tp_price):
     """Alpaca broker-side OCO for an already-open long position."""
     payload = {
@@ -706,24 +725,42 @@ def handle_pending_entry(data):
         if current is None or current <= 0:
             return {"status": "rejected", "reason": "pending_only: no live price"}
 
-        # Buy-stop entry is only valid when live price is still below the desired entry.
-        # If price already touched/passed the entry, reject instead of chasing with market.
-        if REJECT_IF_ENTRY_ALREADY_PASSED and current >= entry:
-            return {"status": "rejected", "reason": f"pending_only: live {current:.8f} already >= entry {entry:.8f}; no market fallback"}
+        # Pending-only with near-entry tolerance:
+        # 1) live < entry  -> STOP BRACKET waiting for breakout at entry.
+        # 2) live >= entry but still close -> LIMIT BRACKET at entry, waiting for a pullback/retest.
+        # 3) live too far above entry -> reject; no market chasing.
+        dev_pct_now = abs(current - entry) / entry * 100.0 if entry else 999.0
 
         cancel_all_orders(symbol)
-        order = place_bracket_stop_buy(symbol, qty, entry, sl, tp)
+        if REJECT_IF_ENTRY_ALREADY_PASSED and current >= entry:
+            if dev_pct_now <= NEAR_ENTRY_TOLERANCE_PCT:
+                order = place_bracket_limit_buy(symbol, qty, entry, sl, tp)
+                entry_order_type = "LIMIT_BRACKET_NEAR_ENTRY"
+                sl_order_id = order.get("id") or "BRACKET_LIMIT_PENDING"
+                log_name = "PENDING_ONLY_LIMIT_NEAR_ENTRY"
+                method = "pending_only_limit_near_entry"
+                log_details = f"entry={entry} live={current} dev={dev_pct_now:.4f}% tol={NEAR_ENTRY_TOLERANCE_PCT:.4f}%"
+            else:
+                return {"status": "rejected", "reason": f"pending_only: live {current:.8f} already above entry {entry:.8f} by {dev_pct_now:.4f}% > tolerance {NEAR_ENTRY_TOLERANCE_PCT:.4f}%; no market fallback"}
+        else:
+            order = place_bracket_stop_buy(symbol, qty, entry, sl, tp)
+            entry_order_type = "STOP_BRACKET_PENDING_ONLY"
+            sl_order_id = order.get("id") or "BRACKET_STOP_PENDING"
+            log_name = "PENDING_ONLY_BRACKET_STOP"
+            method = "pending_only_bracket_stop"
+            log_details = f"entry={entry} live={current}"
+
         with state_lock:
             s.update({
                 "pending": True, "in_trade": False,
                 "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
-                "qty": qty, "order_id": order["id"], "sl_order_id": order.get("id") or "BRACKET_STOP_PENDING",
-                "entry_order_type": "STOP_BRACKET_PENDING_ONLY",
+                "qty": qty, "order_id": order["id"], "sl_order_id": sl_order_id,
+                "entry_order_type": entry_order_type,
                 "open_time": datetime.utcnow().isoformat(),
             })
             save_state(symbol, s)
-        log_action(symbol, "PENDING_ONLY_BRACKET_STOP", f"entry={entry} live={current}")
-        return {"status": "ok", "method": "pending_only_bracket_stop", "order_id": order.get("id")}
+        log_action(symbol, log_name, log_details)
+        return {"status": "ok", "method": method, "order_id": order.get("id")}
     except Exception as e:
         s["last_error"] = str(e)
         save_state(symbol, s)
