@@ -1,5 +1,5 @@
 """
-Alpaca Stocks Bot v13 FULL PROTECTION + SIMPLE DASHBOARD Railway/GitHub
+Alpaca Stocks Bot - V15 FINAL PENDING ONLY v13 FULL PROTECTION + SIMPLE DASHBOARD Railway/GitHub
 + قاعدة بيانات PostgreSQL كاملة
 + Fast Webhook ACK: يرد فوراً ثم ينفذ الإشارة في الخلفية
 """
@@ -50,6 +50,26 @@ FIXED_COST_RT      = env_float("FIXED_COST_RT", 0.0)       # fixed USD round tri
 # If bracket/OCO cannot be created, the bot refuses the entry or closes immediately.
 BROKER_PROTECTION_MODE = os.environ.get("BROKER_PROTECTION_MODE", "BRACKET").upper()
 REQUIRE_BROKER_PROTECTION = os.environ.get("REQUIRE_BROKER_PROTECTION", "true").lower() == "true"
+
+
+# ====================================================================
+# BACKTEST MIRROR MODE
+# ====================================================================
+# هدفه: لا ننفذ الصفقة لايف إلا إذا السعر الحقيقي قريب من سعر دخول TradingView.
+# هذا يمنع دخول متأخر يسبب خسائر R كبيرة مقارنة بالباك تست.
+BACKTEST_MIRROR_MODE = os.environ.get("BACKTEST_MIRROR_MODE", "true").lower() == "true"
+MAX_ENTRY_DEVIATION_PCT = env_float("MAX_ENTRY_DEVIATION_PCT", 0.05)  # max allowed live-vs-TV entry deviation %
+REJECT_IF_PRICE_BEYOND_SL_TP = os.environ.get("REJECT_IF_PRICE_BEYOND_SL_TP", "true").lower() == "true"
+MIRROR_REJECT_IF_NO_PRICE = os.environ.get("MIRROR_REJECT_IF_NO_PRICE", "true").lower() == "true"
+
+# ====================================================================
+# FINAL PENDING-ONLY ENTRY CONTROL
+# ====================================================================
+# Never chase entry with market orders. The bot places a real waiting stop-entry
+# bracket at TradingView entry. If price already passed entry, reject the signal.
+PENDING_ONLY_ENTRY = os.environ.get("PENDING_ONLY_ENTRY", "true").lower() == "true"
+REJECT_IF_ENTRY_ALREADY_PASSED = os.environ.get("REJECT_IF_ENTRY_ALREADY_PASSED", "true").lower() == "true"
+
 
 
 
@@ -446,6 +466,39 @@ def get_current_price(symbol):
     except:
         return None
 
+def backtest_mirror_check(symbol, entry, sl, tp, mode="market"):
+    """Return (ok, reason, current).
+    mode="market": price must be close to TradingView entry now.
+    mode="pending": allow current below entry because broker stop order waits at entry; reject only if already too far above entry.
+    """
+    if not BACKTEST_MIRROR_MODE:
+        return True, "mirror off", None
+    try:
+        entry = float(entry); sl = float(sl); tp = float(tp)
+        if entry <= 0:
+            return False, "mirror: invalid entry", None
+        current = get_current_price(symbol)
+        if current is None or current <= 0:
+            if MIRROR_REJECT_IF_NO_PRICE:
+                return False, "mirror: no live price", current
+            return True, "mirror: no price but allowed", current
+
+        if REJECT_IF_PRICE_BEYOND_SL_TP:
+            if sl and current <= float(sl):
+                return False, f"mirror: live {current:.8f} already <= SL {float(sl):.8f}", current
+            if tp and current >= float(tp):
+                return False, f"mirror: live {current:.8f} already >= TP {float(tp):.8f}", current
+
+        if mode == "pending" and current < entry:
+            return True, f"mirror ok pending live={current:.8f} below entry={entry:.8f}", current
+
+        dev_pct = abs(current - entry) / entry * 100.0
+        if dev_pct > MAX_ENTRY_DEVIATION_PCT:
+            return False, f"mirror: deviation {dev_pct:.4f}% > max {MAX_ENTRY_DEVIATION_PCT:.4f}% live={current:.8f} tv={entry:.8f}", current
+        return True, f"mirror ok dev={dev_pct:.4f}% live={current:.8f} tv={entry:.8f}", current
+    except Exception as e:
+        return False, f"mirror error: {e}", None
+
 def cancel_all_orders(symbol):
     try:
         orders = alpaca_get(f"orders?status=open&symbols={symbol}")
@@ -622,37 +675,10 @@ def net_profit_filter_check(entry, sl, tp, qty):
 # معالجات الإشارات
 # ====================================================================
 def handle_entry(data):
-    symbol = data["symbol"]
-    entry  = float(data["entry"])
-    sl     = float(data["backup_sl"])
-    tp     = float(data["tp"])
-    qty    = float(data["qty"])
-    s = get_state(symbol)
-    if s["in_trade"] or s["pending"]:
-        return {"status": "ignored"}
-    ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
-    if not ok_filter:
-        return {"status": "rejected", "reason": filter_reason}
-    if not is_market_open():
-        return {"status": "ignored", "reason": "السوق مغلق"}
-    try:
-        cancel_all_orders(symbol)
-        order = place_bracket_market_buy(symbol, qty, sl, tp)
-        sl_id = order.get("id") or "BRACKET"
-        with state_lock:
-            s.update({
-                "in_trade": True, "pending": False,
-                "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
-                "qty": qty, "order_id": order["id"], "sl_order_id": sl_id,
-                "open_time": datetime.utcnow().isoformat(),
-            })
-            save_state(symbol, s)
-        log_action(symbol, "ENTRY_MARKET", f"qty={qty}")
-        return {"status": "ok", "method": "market"}
-    except Exception as e:
-        s["last_error"] = str(e)
-        save_state(symbol, s)
-        return {"status": "error", "message": str(e)}
+    # FINAL PENDING-ONLY RULE:
+    # Even if TradingView sends action=ENTRY from strategy.order.alert_message,
+    # we do NOT open market. We treat it as a request to place a waiting stop-entry bracket.
+    return handle_pending_entry(data)
 
 def handle_pending_entry(data):
     symbol = data["symbol"]
@@ -662,68 +688,52 @@ def handle_pending_entry(data):
     qty    = float(data["qty"])
     s = get_state(symbol)
     if s["in_trade"] or s["pending"]:
-        return {"status": "ignored"}
+        return {"status": "ignored", "reason": "already in trade or pending"}
+
     ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
     if not ok_filter:
         return {"status": "rejected", "reason": filter_reason}
+
+    ok_mirror, mirror_reason, mirror_price = backtest_mirror_check(symbol, entry, sl, tp, mode="pending")
+    if not ok_mirror:
+        return {"status": "rejected", "reason": mirror_reason}
+
     if not is_market_open():
         return {"status": "ignored", "reason": "السوق مغلق"}
+
     try:
         current = get_current_price(symbol)
-        if current and (current - entry) / entry * 100 > 0.5:
-            order = place_bracket_market_buy(symbol, qty, sl, tp)
-            sl_id = order.get("id") or "BRACKET"
-            with state_lock:
-                s.update({
-                    "in_trade": True, "pending": False,
-                    "entry_price": current, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
-                    "qty": qty, "order_id": order["id"], "sl_order_id": sl_id,
-                    "open_time": datetime.utcnow().isoformat(),
-                })
-            log_action(symbol, "ENTRY_MARKET_FALLBACK", f"qty={qty}")
-            return {"status": "ok", "method": "market"}
+        if current is None or current <= 0:
+            return {"status": "rejected", "reason": "pending_only: no live price"}
+
+        # Buy-stop entry is only valid when live price is still below the desired entry.
+        # If price already touched/passed the entry, reject instead of chasing with market.
+        if REJECT_IF_ENTRY_ALREADY_PASSED and current >= entry:
+            return {"status": "rejected", "reason": f"pending_only: live {current:.8f} already >= entry {entry:.8f}; no market fallback"}
+
+        cancel_all_orders(symbol)
         order = place_bracket_stop_buy(symbol, qty, entry, sl, tp)
         with state_lock:
             s.update({
-                "pending": True,
+                "pending": True, "in_trade": False,
                 "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
-                "qty": qty, "order_id": order["id"],
+                "qty": qty, "order_id": order["id"], "sl_order_id": order.get("id") or "BRACKET_STOP_PENDING",
+                "entry_order_type": "STOP_BRACKET_PENDING_ONLY",
                 "open_time": datetime.utcnow().isoformat(),
             })
             save_state(symbol, s)
-        log_action(symbol, "PENDING_ENTRY", f"entry={entry}")
-        return {"status": "ok"}
+        log_action(symbol, "PENDING_ONLY_BRACKET_STOP", f"entry={entry} live={current}")
+        return {"status": "ok", "method": "pending_only_bracket_stop", "order_id": order.get("id")}
     except Exception as e:
         s["last_error"] = str(e)
+        save_state(symbol, s)
         return {"status": "error", "message": str(e)}
 
 def handle_entry_filled(data):
-    symbol = data["symbol"]
-    entry  = float(data["entry"])
-    sl     = float(data["backup_sl"])
-    tp     = float(data["tp"])
-    qty    = float(data["qty"])
-    s = get_state(symbol)
-    ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
-    if not ok_filter:
-        return {"status": "rejected", "reason": filter_reason}
-    try:
-        cancel_all_orders(symbol)
-        order = place_bracket_market_buy(symbol, qty, sl, tp)
-        sl_id = order.get("id") or "BRACKET"
-        with state_lock:
-            s.update({
-                "in_trade": True, "pending": False,
-                "entry_price": entry, "backup_sl": sl, "initial_sl": sl, "current_sl": sl, "tp_price": tp,
-                "qty": qty, "order_id": order["id"], "sl_order_id": sl_id,
-                "open_time": datetime.utcnow().isoformat(),
-            })
-            save_state(symbol, s)
-        log_action(symbol, "ENTRY_FILLED", f"entry={entry} sl_prev={sl}")
-        return {"status": "ok"}
-    except Exception as e:
-        s["last_error"] = str(e)
-        return {"status": "error", "message": str(e)}
+    # TradingView order-fill alerts are not Alpaca fills. Never use them to market buy.
+    # If there is already pending/in_trade, it will be ignored by handle_pending_entry().
+    return handle_pending_entry(data)
+
 
 def handle_exit(data):
     symbol     = data.get("symbol")
