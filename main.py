@@ -88,6 +88,7 @@ PENDING_MAX_AGE_MIN = env_float("PENDING_MAX_AGE_MIN", 180.0)
 BROKER_RECONCILE_ENABLED = os.environ.get("BROKER_RECONCILE_ENABLED", "true").lower() == "true"
 RECONCILE_UNPROTECTED_ACTION = os.environ.get("RECONCILE_UNPROTECTED_ACTION", "CLOSE").upper()  # CLOSE or REPROTECT
 EXECUTION_ERROR_R_THRESHOLD = env_float("EXECUTION_ERROR_R_THRESHOLD", -1.05)
+UNPROTECTED_GRACE_SEC = env_float("UNPROTECTED_GRACE_SEC", 20.0)
 
 
 # ====================================================================
@@ -132,7 +133,7 @@ def _apply_bot_settings():
     global BACKTEST_MIRROR_MODE, MAX_ENTRY_DEVIATION_PCT, REJECT_IF_PRICE_BEYOND_SL_TP, MIRROR_REJECT_IF_NO_PRICE
     global PENDING_ONLY_ENTRY, REJECT_IF_ENTRY_ALREADY_PASSED, NEAR_ENTRY_TOLERANCE_PCT
     global BOT_BE_ENABLED, BOT_BE_TRIGGER_R, BOT_BE_LOCK_R, BOT_BE_UPDATE_BROKER, MONITOR_INTERVAL_SEC, PENDING_MAX_AGE_MIN
-    global BROKER_RECONCILE_ENABLED, RECONCILE_UNPROTECTED_ACTION, EXECUTION_ERROR_R_THRESHOLD
+    global BROKER_RECONCILE_ENABLED, RECONCILE_UNPROTECTED_ACTION, EXECUTION_ERROR_R_THRESHOLD, UNPROTECTED_GRACE_SEC
     cfg = _load_bot_settings()
     if not cfg:
         return
@@ -192,6 +193,8 @@ def _apply_bot_settings():
         RECONCILE_UNPROTECTED_ACTION = str(cfg.get("unprotected")).strip().upper()
     if "exec_err_r" in cfg:
         EXECUTION_ERROR_R_THRESHOLD = _bot_float(cfg.get("exec_err_r"), EXECUTION_ERROR_R_THRESHOLD)
+    if "unprotected_grace" in cfg:
+        UNPROTECTED_GRACE_SEC = _bot_float(cfg.get("unprotected_grace"), UNPROTECTED_GRACE_SEC)
 
 _apply_bot_settings()
 
@@ -261,7 +264,7 @@ def init_db():
                         initial_sl_price FLOAT,
                         current_sl_price FLOAT,
                         tp_price FLOAT,
-                        exit_reason VARCHAR(20),
+                        exit_reason TEXT,
                         qty FLOAT,
                         pnl FLOAT,
                         pnl_pct FLOAT,
@@ -282,8 +285,8 @@ def init_db():
                         id SERIAL PRIMARY KEY,
                         received_at TIMESTAMP DEFAULT NOW(),
                         symbol VARCHAR(20),
-                        action VARCHAR(40),
-                        status VARCHAR(40),
+                        action TEXT,
+                        status TEXT,
                         reason TEXT,
                         entry_price FLOAT,
                         sl_price FLOAT,
@@ -301,7 +304,7 @@ def init_db():
                         id SERIAL PRIMARY KEY,
                         created_at TIMESTAMP DEFAULT NOW(),
                         symbol VARCHAR(20),
-                        action VARCHAR(60),
+                        action TEXT,
                         details TEXT
                     )
                 """)
@@ -318,12 +321,17 @@ def init_db():
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS initial_sl_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS current_sl_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_price FLOAT")
-                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(20)")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS qty FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl_pct FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS duration_min INT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS rr_actual FLOAT")
+                # V29: widen old varchar columns so long guard/reconcile reasons do not crash saving trades.
+                cur.execute("ALTER TABLE trades ALTER COLUMN exit_reason TYPE TEXT")
+                cur.execute("ALTER TABLE signal_events ALTER COLUMN action TYPE TEXT")
+                cur.execute("ALTER TABLE signal_events ALTER COLUMN status TYPE TEXT")
+                cur.execute("ALTER TABLE action_events ALTER COLUMN action TYPE TEXT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_quality VARCHAR(30) DEFAULT 'Clean'")
 
                 cur.execute("ALTER TABLE active_states ADD COLUMN IF NOT EXISTS state_json TEXT")
@@ -331,8 +339,8 @@ def init_db():
 
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
-                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS action VARCHAR(40)")
-                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS status VARCHAR(40)")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS action TEXT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS status TEXT")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS reason TEXT")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS entry_price FLOAT")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS sl_price FLOAT")
@@ -344,7 +352,7 @@ def init_db():
 
                 cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
                 cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
-                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS action VARCHAR(60)")
+                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS action TEXT")
                 cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS details TEXT")
             conn.commit()
         log.info("✅ قاعدة البيانات جاهزة")
@@ -1279,16 +1287,36 @@ def broker_reconcile_once():
                 open_orders = []
 
             if len(open_orders) == 0:
+                # V29: grace window before closing as unprotected, to avoid false close during bracket/SL replace.
+                now_ts = time_module.time()
+                first_seen = safe_float(st.get("unprotected_first_seen_ts"), 0.0)
+                if not first_seen:
+                    with state_lock:
+                        s = get_state(symbol)
+                        s["unprotected_first_seen_ts"] = now_ts
+                        save_state(symbol, s)
+                    log_action(symbol, "RECONCILE_UNPROTECTED_GRACE", f"qty={actual_qty} grace={UNPROTECTED_GRACE_SEC}s")
+                    continue
+                if now_ts - first_seen < UNPROTECTED_GRACE_SEC:
+                    log_action(symbol, "RECONCILE_UNPROTECTED_WAIT", f"age={round(now_ts-first_seen,1)}s grace={UNPROTECTED_GRACE_SEC}s")
+                    continue
                 if RECONCILE_UNPROTECTED_ACTION == "REPROTECT" and sl and tp:
                     oid = place_broker_exit_protection(symbol, min(actual_qty, safe_float(st.get("qty"), actual_qty) or actual_qty), sl, tp)
                     if oid:
                         with state_lock:
                             s = get_state(symbol)
                             s["sl_order_id"] = oid
+                            s.pop("unprotected_first_seen_ts", None)
                             save_state(symbol, s)
                         log_action(symbol, "RECONCILE_REPROTECT", f"qty={actual_qty} sl={sl} tp={tp}")
                         continue
                 emergency_close_unprotected(symbol, min(actual_qty, safe_float(st.get("qty"), actual_qty) or actual_qty), "RECONCILE_UNPROTECTED_CLOSE")
+            else:
+                if st.get("unprotected_first_seen_ts"):
+                    with state_lock:
+                        s = get_state(symbol)
+                        s.pop("unprotected_first_seen_ts", None)
+                        save_state(symbol, s)
 
         except Exception as e:
             log.error(f"[{symbol}] broker reconcile error: {e}")
@@ -1511,6 +1539,30 @@ def reset_route(symbol):
 def trade_dt(t, key):
     return safe_dt(t.get(key))
 
+SL_EXIT_REASONS = {"SL", "GUARD_SL", "SL_RECONCILE", "RECONCILE_UNPROTECTED_CLOSE", "NO_BROKER_PROTECTION", "NO_BROKER_PROTECTION_AFTER_PENDING_FILL", "NO_BROKER_PROTECTION_AFTER_SL_UPDATE", "BE_CANCEL_FAILED", "BE_PROTECTION_FAILED", "RECHECK_FILLED_NO_PROTECTION"}
+TP_EXIT_REASONS = {"TP", "GUARD_TP", "TP_RECONCILE"}
+BE_EXIT_REASONS = {"BE", "SL_MARKET", "BE_RECONCILE"}
+
+def classify_exit_reason(r, pnl=None):
+    r = str(r or "")
+    if r in TP_EXIT_REASONS:
+        return "TP"
+    if r in BE_EXIT_REASONS:
+        return "BE"
+    if r in SL_EXIT_REASONS:
+        return "SL"
+    if "SL" in r or "UNPROTECTED" in r or "PROTECTION" in r:
+        return "SL"
+    if "TP" in r:
+        return "TP"
+    if pnl is not None:
+        try:
+            if abs(float(pnl)) < 0.0000001:
+                return "BE"
+        except Exception:
+            pass
+    return r
+
 def reason_ar(r):
     if r == "TP": return "✅ تيك بروفت"
     if r in ("BE", "SL_MARKET"): return "➡️ بريك ايفن"
@@ -1522,9 +1574,9 @@ def calc_trade_metrics(trades):
     total_pnl = sum(float(t.get("pnl") or 0) for t in trades)
     wins = [t for t in trades if float(t.get("pnl") or 0) > 0]
     losses = [t for t in trades if float(t.get("pnl") or 0) < 0]
-    tp = [t for t in trades if t.get("exit_reason") == "TP"]
-    be = [t for t in trades if t.get("exit_reason") in ("BE", "SL_MARKET")]
-    sl = [t for t in trades if t.get("exit_reason") == "SL"]
+    tp = [t for t in trades if classify_exit_reason(t.get("exit_reason"), t.get("pnl")) == "TP"]
+    be = [t for t in trades if classify_exit_reason(t.get("exit_reason"), t.get("pnl")) == "BE"]
+    sl = [t for t in trades if classify_exit_reason(t.get("exit_reason"), t.get("pnl")) == "SL"]
     gp = sum(float(t.get("pnl") or 0) for t in wins)
     gl = abs(sum(float(t.get("pnl") or 0) for t in losses))
     rr_values = [float(t.get("rr_actual")) for t in trades if t.get("rr_actual") is not None]
