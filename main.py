@@ -1,8 +1,10 @@
 """
-Alpaca Stocks Bot - V28 (V27 + pending TTL + no zero-qty liquidation)
+Alpaca Stocks Bot - V31 REPLACE PENDING NO EXPIRY
 + قاعدة بيانات PostgreSQL كاملة
 + Fast Webhook ACK: يرد فوراً ثم ينفذ الإشارة في الخلفية
 """
+
+# V32: net filter default OFF. New signals replace old pending. No pending expiry.
 
 import os
 import logging
@@ -36,7 +38,7 @@ def env_float(name, default):
     except Exception:
         return float(default)
 
-NET_FILTER_ENABLED = os.environ.get("NET_FILTER_ENABLED", "true").lower() == "true"
+NET_FILTER_ENABLED = os.environ.get("NET_FILTER_ENABLED", "false").lower() == "true"
 MIN_RISK_PCT       = env_float("MIN_RISK_PCT", 0.10)       # percent of entry price
 MIN_NET_RR         = env_float("MIN_NET_RR", 1.20)         # net profit / net loss minimum
 FEE_RATE_PER_SIDE  = env_float("FEE_RATE_PER_SIDE", 0.0)   # decimal, Alpaca stock commission often 0
@@ -81,8 +83,6 @@ BOT_BE_TRIGGER_R = env_float("BOT_BE_TRIGGER_R", 0.30)
 BOT_BE_LOCK_R = env_float("BOT_BE_LOCK_R", 0.00)
 BOT_BE_UPDATE_BROKER = os.environ.get("BOT_BE_UPDATE_BROKER", "true").lower() == "true"
 MONITOR_INTERVAL_SEC = env_float("MONITOR_INTERVAL_SEC", 1.0)
-# V28: safety expiry for broker pending orders if TradingView CANCEL is missed. 0 = disabled.
-PENDING_MAX_AGE_MIN = env_float("PENDING_MAX_AGE_MIN", 180.0)
 
 # V20 FINAL HARDENED: broker reconcile checks the broker itself, not only bot memory.
 BROKER_RECONCILE_ENABLED = os.environ.get("BROKER_RECONCILE_ENABLED", "true").lower() == "true"
@@ -132,7 +132,7 @@ def _apply_bot_settings():
     global BROKER_PROTECTION_MODE, REQUIRE_BROKER_PROTECTION
     global BACKTEST_MIRROR_MODE, MAX_ENTRY_DEVIATION_PCT, REJECT_IF_PRICE_BEYOND_SL_TP, MIRROR_REJECT_IF_NO_PRICE
     global PENDING_ONLY_ENTRY, REJECT_IF_ENTRY_ALREADY_PASSED, NEAR_ENTRY_TOLERANCE_PCT
-    global BOT_BE_ENABLED, BOT_BE_TRIGGER_R, BOT_BE_LOCK_R, BOT_BE_UPDATE_BROKER, MONITOR_INTERVAL_SEC, PENDING_MAX_AGE_MIN
+    global BOT_BE_ENABLED, BOT_BE_TRIGGER_R, BOT_BE_LOCK_R, BOT_BE_UPDATE_BROKER, MONITOR_INTERVAL_SEC
     global BROKER_RECONCILE_ENABLED, RECONCILE_UNPROTECTED_ACTION, EXECUTION_ERROR_R_THRESHOLD, UNPROTECTED_GRACE_SEC
     cfg = _load_bot_settings()
     if not cfg:
@@ -183,8 +183,6 @@ def _apply_bot_settings():
         BOT_BE_UPDATE_BROKER = _bot_bool(cfg.get("be_update"), BOT_BE_UPDATE_BROKER)
     if "monitor" in cfg:
         MONITOR_INTERVAL_SEC = _bot_float(cfg.get("monitor"), MONITOR_INTERVAL_SEC)
-    if "pending_expiry" in cfg:
-        PENDING_MAX_AGE_MIN = _bot_float(cfg.get("pending_expiry"), PENDING_MAX_AGE_MIN)
 
 
     if "reconcile" in cfg:
@@ -855,8 +853,14 @@ def handle_pending_entry(data):
     tp     = float(data["tp"])
     qty    = float(data["qty"])
     s = get_state(symbol)
-    if s["in_trade"] or s["pending"]:
-        return {"status": "ignored", "reason": "already in trade or pending"}
+    if s.get("in_trade"):
+        return {"status": "ignored", "reason": "already in trade"}
+    if s.get("pending"):
+        # New setup replaces old setup: cancel old pending, then accept the new signal.
+        _safe_cancel_pending_entry_alpaca(symbol, reason="REPLACED_BY_NEW_SIGNAL", exit_price=s.get("entry_price"), pnl=0.0, close_if_filled=True)
+        s = get_state(symbol)
+        if s.get("in_trade") or s.get("pending"):
+            return {"status": "ignored", "reason": "old pending not cleanly cleared; skipped new signal to stay safe"}
 
     ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
     if not ok_filter:
@@ -1264,7 +1268,30 @@ def broker_reconcile_once():
             tp = safe_float(st.get("tp_price"))
             current = get_current_price(symbol)
 
+            try:
+                open_orders = alpaca_get(f"orders?status=open&symbols={symbol}")
+            except Exception:
+                open_orders = []
+
             if actual_qty <= 0:
+                # V31: avoid false BROKER_FLAT_RECONCILE during a short Alpaca position/order refresh gap.
+                # If bracket/exit orders still exist, the trade is not safely confirmed flat.
+                if len(open_orders) > 0:
+                    log_action(symbol, "RECONCILE_FLAT_BUT_ORDERS_WAIT", f"open_orders={len(open_orders)}; not resetting yet")
+                    continue
+                now_ts = time_module.time()
+                first_seen = safe_float(st.get("flat_first_seen_ts"), 0.0)
+                if not first_seen:
+                    with state_lock:
+                        s = get_state(symbol)
+                        s["flat_first_seen_ts"] = now_ts
+                        save_state(symbol, s)
+                    log_action(symbol, "RECONCILE_FLAT_GRACE", f"grace={UNPROTECTED_GRACE_SEC}s")
+                    continue
+                if now_ts - first_seen < UNPROTECTED_GRACE_SEC:
+                    log_action(symbol, "RECONCILE_FLAT_WAIT", f"age={round(now_ts-first_seen,1)}s grace={UNPROTECTED_GRACE_SEC}s")
+                    continue
+
                 exit_price = current or tp or sl or entry or 0.0
                 pnl = (exit_price - (entry or exit_price)) * safe_float(st.get("qty"), 0.0)
                 reason = "BROKER_FLAT_RECONCILE"
@@ -1278,13 +1305,14 @@ def broker_reconcile_once():
                            tp=st.get("tp_price"), open_time=st.get("open_time"),
                            trade_quality="BrokerReconcile")
                 reset_symbol(symbol)
-                log_action(symbol, reason, f"alpaca flat; reset stale state price={exit_price}")
+                log_action(symbol, reason, f"alpaca flat confirmed after grace; reset stale state price={exit_price}")
                 continue
 
-            try:
-                open_orders = alpaca_get(f"orders?status=open&symbols={symbol}")
-            except Exception:
-                open_orders = []
+            if st.get("flat_first_seen_ts"):
+                with state_lock:
+                    s = get_state(symbol)
+                    s.pop("flat_first_seen_ts", None)
+                    save_state(symbol, s)
 
             if len(open_orders) == 0:
                 # V29: grace window before closing as unprotected, to avoid false close during bracket/SL replace.
@@ -1388,12 +1416,6 @@ def monitor_orders():
                 if not s.get("pending") or not s.get("order_id"):
                     continue
                 try:
-                    # V28: expire stale pending broker orders if TradingView cancel was missed.
-                    if PENDING_MAX_AGE_MIN and PENDING_MAX_AGE_MIN > 0:
-                        opened = safe_dt(s.get("open_time"))
-                        if opened and (datetime.utcnow() - opened).total_seconds() > PENDING_MAX_AGE_MIN * 60:
-                            _safe_cancel_pending_entry_alpaca(symbol, reason="BOT_PENDING_EXPIRED", exit_price=get_current_price(symbol) or s.get("entry_price"), pnl=0.0, close_if_filled=True)
-                            continue
                     order = alpaca_get(f"orders/{s['order_id']}")
                     status = order.get("status", "")
                     filled_qty = safe_float(order.get("filled_qty"), 0.0) or 0.0
